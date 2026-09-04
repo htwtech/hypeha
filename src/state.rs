@@ -116,6 +116,18 @@ impl SubKey {
         }
     }
 
+    /// Whether one source carries the whole stream rather than the sources
+    /// taking turns.
+    ///
+    /// It decides what a snapshot from somebody other than the leader means. On
+    /// the raced channels it is a reset, and the only way a written-off source
+    /// returns. Here it is simply a different node's book, and acting on it
+    /// would move the client across mid-stream -- silently, since both books are
+    /// internally consistent.
+    pub fn single_sourced(&self) -> bool {
+        matches!(self, Self::L2Diff { .. })
+    }
+
     /// Whether the channel streams increments against a prior snapshot, so that
     /// a dropped or out-of-order frame corrupts the client's book for good.
     pub fn is_incremental(&self) -> bool {
@@ -601,14 +613,15 @@ impl AppState {
                 // A snapshot is a reset, and the one thing that puts a written
                 // off source back in play.
                 entry.needs_snapshot &= !source_bit(src.id);
-                // ...but only from the source we are following, or from anyone
-                // when we are following nobody. Every source snapshots when it
-                // subscribes and again on every reconnect, so an unguarded
-                // reset let a source that happened to be a block ahead seize
-                // the stream from a healthy leader -- moving the client onto a
-                // different node's book behind its back, which is the one thing
-                // `Seq::Sticky` exists to prevent.
-                let ours = entry.block_leader.map_or(true, |id| id == src.id);
+                // On a single-sourced channel, only from the source we are
+                // following -- or from anyone when we are following nobody.
+                // Every source snapshots when it subscribes and again on every
+                // reconnect, so without this a source that happened to be a
+                // block ahead seized the stream from a healthy leader and moved
+                // the client onto its book. Elsewhere the reset stays
+                // unconditional: that is how a written-off source comes back.
+                let ours = !entry.key().single_sourced()
+                    || entry.block_leader.map_or(true, |id| id == src.id);
                 if ours && h > entry.last {
                     entry.last = h;
                     entry.last_seen_at = now;
