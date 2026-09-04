@@ -237,10 +237,10 @@ async fn snapshot_from(url: &str, key: &SubKey) -> Option<(u64, Utf8Bytes)> {
         // frames until the timeout and then disconnected the very client it was
         // sent to rebuild -- a channel-specific test inside a path every
         // incremental channel depends on.
-        if let Some((found, Seq::Snapshot(height))) = route(frame)
-            && found == *key
-        {
-            return Some((height, Utf8Bytes::from(text.as_str().to_string())));
+        if let Some((found, Seq::Snapshot(height))) = route(frame) {
+            if found == *key {
+                return Some((height, Utf8Bytes::from(text.as_str().to_string())));
+            }
         }
     }
     None
