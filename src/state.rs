@@ -274,7 +274,10 @@ const PENDING_MAX_BYTES: usize = 64 * 1024 * 1024;
 /// the snapshot's height and the moment the client is attached.
 struct Pending {
     client: Arc<Client>,
-    held: VecDeque<(u64, Utf8Bytes)>,
+    /// Source, height, payload. The source matters on a single-sourced
+    /// channel: the snapshot this client is rebuilt on comes from one node, and
+    /// only that node's increments belong on top of it.
+    held: VecDeque<(usize, u64, Utf8Bytes)>,
     bytes: usize,
 }
 
@@ -683,11 +686,11 @@ impl AppState {
         // ones whose backlog has outgrown the cap.
         let mut overflowed: Vec<Arc<Client>> = Vec::new();
         if deliver && !entry.pending.is_empty() {
-            if let Seq::Block(h) | Seq::Snapshot(h) = seq {
+            if let Seq::Block(h) | Seq::Snapshot(h) | Seq::Sticky(h) = seq {
                 let n = payload.as_str().len();
                 for p in entry.pending.iter_mut() {
                     p.bytes += n;
-                    p.held.push_back((h, payload.clone()));
+                    p.held.push_back((src.id, h, payload.clone()));
                 }
                 entry.pending.retain(|p| {
                     if p.bytes > PENDING_MAX_BYTES {
@@ -736,7 +739,7 @@ impl AppState {
     ///
     /// Everything held at or below the snapshot's own height is already baked
     /// into it and would be applied twice, so it is discarded.
-    pub fn deliver_snapshot(&self, key: &SubKey, client_id: u64, height: u64, snapshot: Utf8Bytes) {
+    pub fn deliver_snapshot(&self, key: &SubKey, client_id: u64, source: usize, height: u64, snapshot: Utf8Bytes) {
         let mut client = None;
         let mut backlog: Vec<Utf8Bytes> = Vec::new();
 
@@ -744,7 +747,24 @@ impl AppState {
             if let Some(idx) = entry.pending.iter().position(|p| p.client.id == client_id) {
                 let Pending { client: c, held, .. } = entry.pending.remove(idx);
                 backlog.push(snapshot);
-                backlog.extend(held.into_iter().filter(|(h, _)| *h > height).map(|(_, b)| b));
+                // On a single-sourced channel only the snapshot's own source may
+                // follow it: an increment computed against another node's book
+                // does not apply to this one. Elsewhere every source's frames
+                // are equally valid, which is the point of racing them.
+                let single = key.single_sourced();
+                backlog.extend(
+                    held.into_iter()
+                        .filter(|(sid, h, _)| *h > height && (!single || *sid == source))
+                        .map(|(_, _, b)| b),
+                );
+                // Pin the leader to whoever the snapshot came from. Without it
+                // the source that answered the fetch and the source that took
+                // the stream are two independent choices, and with more than two
+                // nodes they can differ -- splicing one node's increments onto
+                // another's book.
+                if single {
+                    entry.block_leader = Some(source);
+                }
                 entry.subscribers.push(c.clone());
                 client = Some(c);
             }
@@ -994,6 +1014,37 @@ mod tests {
     }
 
     #[test]
+    fn a_rebuilt_client_follows_the_source_its_snapshot_came_from() {
+        let state = test_state(2);
+        let key = SubKey::L2Diff { coin: "BTC".into(), n_sig_figs: None, n_levels: None, mantissa: None };
+        let (client, mut rx) = state.register_client("t".into());
+        state.subscribe(&client, key.clone());
+
+        let a = state.sources[0].clone();
+        let b = state.sources[1].clone();
+
+        state.on_update(&a, key.clone(), Seq::Snapshot(10), msg("snap-a"));
+        state.on_update(&a, key.clone(), Seq::Sticky(11), msg("11-a"));
+        assert_eq!(drain(&mut rx), vec!["snap-a", "11-a"]);
+
+        // `a` dies. While the client is parked, `b` takes the free leadership
+        // and its frames pile up behind the client.
+        state.resync_after_source_loss(a.id);
+        state.on_update(&b, key.clone(), Seq::Sticky(12), msg("12-b"));
+
+        // The fetch answers from `a` instead -- the freshest source and the
+        // leader are two independent choices. `b`'s held frame was computed
+        // against `b`'s book and must not be laid on `a`'s snapshot.
+        state.deliver_snapshot(&key, client.id, a.id, 11, msg("snap-a2"));
+        assert_eq!(drain(&mut rx), vec!["snap-a2"]);
+
+        // ...and the stream now follows `a`, whose snapshot the client holds.
+        state.on_update(&b, key.clone(), Seq::Sticky(13), msg("13-b"));
+        state.on_update(&a, key.clone(), Seq::Sticky(13), msg("13-a"));
+        assert_eq!(drain(&mut rx), vec!["13-a"]);
+    }
+
+    #[test]
     fn a_reconnecting_source_does_not_steal_a_healthy_stream() {
         let state = test_state(2);
         let key = SubKey::L2Diff { coin: "BTC".into(), n_sig_figs: None, n_levels: None, mantissa: None };
@@ -1145,7 +1196,7 @@ mod tests {
 
         // Snapshot taken at height 11: block 11 is already baked into it and
         // would be applied twice, block 12 is not.
-        state.deliver_snapshot(&key, late.id, 11, msg("snap@11"));
+        state.deliver_snapshot(&key, late.id, a.id, 11, msg("snap@11"));
         assert_eq!(drain(&mut late_rx), vec!["snap@11", "b12"]);
 
         // ...and the client that was there first saw an unbroken stream.
@@ -1220,7 +1271,7 @@ mod tests {
         // `a` stalls. Its client is parked and rebuilt from `b`'s book at 950.
         let work = state.resync_after_source_loss(a.id);
         assert_eq!(work.len(), 1);
-        state.deliver_snapshot(&key, client.id, 950, msg("snap@950"));
+        state.deliver_snapshot(&key, client.id, b.id, 950, msg("snap@950"));
         assert_eq!(drain(&mut rx), vec!["snap@950"]);
 
         // `b` must now be able to drive the stream even though it is hundreds of

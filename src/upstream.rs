@@ -186,29 +186,31 @@ pub async fn fetch_snapshot(state: Arc<AppState>, key: SubKey, client_id: u64) {
     // silently wrong to build on. Only fall back to a quiet source when none of
     // them is delivering, which means the market is quiet and every book is
     // equally current.
-    let mut ranked: Vec<(Duration, String)> = state
+    // The source id travels with the url: whoever answers becomes the leader,
+    // so the book's foundation and the increments laid on it come from one node.
+    let mut ranked: Vec<(Duration, usize, String)> = state
         .sources
         .iter()
         .filter(|s| s.stats.connected.load(Relaxed))
-        .map(|s| (s.stats.idle_for().unwrap_or(Duration::MAX), s.url.clone()))
+        .map(|s| (s.stats.idle_for().unwrap_or(Duration::MAX), s.id, s.url.clone()))
         .collect();
-    ranked.sort_by_key(|(idle, _)| *idle);
+    ranked.sort_by_key(|(idle, _, _)| *idle);
 
-    let fresh: Vec<String> = ranked
+    let fresh: Vec<(usize, String)> = ranked
         .iter()
-        .filter(|(idle, _)| *idle <= crate::stats::SILENCE_LIMIT)
-        .map(|(_, url)| url.clone())
+        .filter(|(idle, _, _)| *idle <= crate::stats::SILENCE_LIMIT)
+        .map(|(_, id, url)| (*id, url.clone()))
         .collect();
-    let urls = if fresh.is_empty() {
-        ranked.into_iter().map(|(_, url)| url).collect()
+    let urls: Vec<(usize, String)> = if fresh.is_empty() {
+        ranked.into_iter().map(|(_, id, url)| (id, url)).collect()
     } else {
         fresh
     };
 
-    for url in urls {
+    for (id, url) in urls {
         match tokio::time::timeout(SNAPSHOT_TIMEOUT, snapshot_from(&url, &key)).await {
             Ok(Some((height, payload))) => {
-                state.deliver_snapshot(&key, client_id, height, payload);
+                state.deliver_snapshot(&key, client_id, id, height, payload);
                 return;
             }
             Ok(None) => tracing::warn!(url = %url, sub = %key.label(), "snapshot fetch failed"),
