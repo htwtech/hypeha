@@ -352,10 +352,10 @@ impl SubEntry {
         self.block_leader
     }
 
-    /// Clients parked awaiting a snapshot of their own. Normally zero, and
-    /// non-zero exactly during a rebuild -- which is otherwise invisible.
-    pub fn rebuilding(&self) -> usize {
-        self.pending.len()
+    /// Whether this client is parked awaiting a snapshot of its own. True
+    /// exactly during a rebuild, which is otherwise invisible from outside.
+    pub fn is_rebuilding(&self, client_id: u64) -> bool {
+        self.pending.iter().any(|p| p.client.id == client_id)
     }
 
     /// Count one more message of the current block from `id`, returning that

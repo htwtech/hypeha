@@ -453,7 +453,31 @@ pub fn render_page(state: &crate::state::AppState) -> String {
     for entry in state.clients.iter() {
         let c = entry.value();
         client_count += 1;
-        let mut subs: Vec<String> = c.subscriptions.lock().unwrap().iter().map(|k| k.label()).collect();
+        // Tag each subscription with the node carrying it. On a sticky channel
+        // that is the whole answer to "whose book is this client seeing", and
+        // the per-source win counts cannot give it: they are aggregates over
+        // every subscription at once. Raced channels are left untagged -- their
+        // leader changes every block, so naming one would misrepresent them.
+        let mut subs: Vec<String> = c
+            .subscriptions
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|k| {
+                let label = k.label();
+                let Some(e) = state.subs.get(k) else { return label };
+                if e.is_rebuilding(c.id) {
+                    format!("{label} (rebuilding)")
+                } else if !k.single_sourced() {
+                    label
+                } else {
+                    match e.leader() {
+                        Some(id) => format!("{label} (node{})", id + 1),
+                        None => format!("{label} (no source)"),
+                    }
+                }
+            })
+            .collect();
         subs.sort();
         client_rows.push_str(&format!(
             "<tr><td>{id}</td><td>{ip}</td><td>{coins}</td><td>{bytes}</td><td>{dropped}</td><td>{age}s</td></tr>",
@@ -538,41 +562,6 @@ th{background:#1c1c1c}
     ));
     out.push_str("<tr><th>node</th><th>peer</th><th>location</th><th>p50</th><th>p95</th><th>p99</th><th>stdev</th><th>last run (UTC+0)</th></tr>\n");
     out.push_str(&peer_rows);
-    out.push_str("</table>\n");
-
-    // Which node each subscription is served from. On a sticky channel that is
-    // the whole answer to "whose book is this client seeing", and there was no
-    // way to tell before: the per-source win counts are aggregates over every
-    // subscription at once.
-    out.push_str("<div class='cap c2'>Subscriptions &mdash; source carrying each stream</div>\n<table>\n");
-    out.push_str("<tr><th>subscription</th><th>served by</th><th>clients</th><th>rebuilding</th></tr>\n");
-    let mut subrows: Vec<(String, String, usize, usize)> = state
-        .subs
-        .iter()
-        .map(|e| {
-            let served = if e.key().single_sourced() {
-                e.leader().map_or_else(|| "&mdash;".to_string(), |id| format!("node{}", id + 1))
-            } else {
-                // A raced channel changes leader every block; naming one would
-                // read as a claim that it does not.
-                "raced".to_string()
-            };
-            (e.key().label(), served, e.subscribers.len(), e.rebuilding())
-        })
-        .collect();
-    subrows.sort();
-    if subrows.is_empty() {
-        out.push_str("<tr><td colspan=4 class=sum>no subscriptions</td></tr>\n");
-    }
-    for (label, served, clients, rebuilding) in subrows {
-        out.push_str(&format!(
-            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>\n",
-            html_escape(&label),
-            served,
-            clients,
-            if rebuilding == 0 { "&mdash;".to_string() } else { rebuilding.to_string() },
-        ));
-    }
     out.push_str("</table>\n");
 
     out.push_str("<div class='cap c3'>Client connections</div>\n<table>\n");
