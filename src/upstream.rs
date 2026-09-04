@@ -61,11 +61,41 @@ pub fn ws_config() -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig 
     cfg
 }
 
-pub async fn connect(url: &str) -> Option<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>> {
-    tokio_tungstenite::connect_async_with_config(url, Some(ws_config()), false)
-        .await
-        .ok()
-        .map(|(ws, _)| ws)
+pub type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+pub async fn connect(url: &str) -> Option<Ws> {
+    connect_with(url, None).await.ok()
+}
+
+/// Connect, optionally presenting an `x-token` header.
+///
+/// The sources are reached directly and need no token; the header is for
+/// reaching wsarb itself through a gateway that authenticates, which is the
+/// only way to measure the path a real client actually takes.
+///
+/// The failure comes back as text rather than being swallowed: a gateway
+/// refuses a bad token with an HTTP status, and "could not connect" would
+/// leave that indistinguishable from a dead port.
+pub async fn connect_with(url: &str, token: Option<&str>) -> Result<Ws, String> {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    use tokio_tungstenite::tungstenite::Error;
+
+    let mut req = url.into_client_request().map_err(|e| e.to_string())?;
+    if let Some(t) = token {
+        let v: tokio_tungstenite::tungstenite::http::HeaderValue =
+            t.parse().map_err(|_| "x-token is not a valid header value".to_string())?;
+        req.headers_mut().insert("x-token", v);
+    }
+    match tokio_tungstenite::connect_async_with_config(req, Some(ws_config()), false).await {
+        Ok((ws, _)) => Ok(ws),
+        Err(Error::Http(resp)) => {
+            let body = resp.body().as_ref()
+                .map(|b| String::from_utf8_lossy(b).trim().to_string())
+                .unwrap_or_default();
+            Err(format!("HTTP {} {}", resp.status().as_u16(), body))
+        }
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 /// Run the lifecycle loop for a single upstream source until the process exits.
@@ -231,6 +261,7 @@ pub enum Frame {
     Trades(Vec<TradeHead>),
     OrderUpdates(Vec<OrderUpdateHead>),
     L4Book(L4Frame),
+    L2Diff(L2DiffFrame),
     Error(String),
 }
 
@@ -268,6 +299,40 @@ pub struct OrderUpdateHead {
 #[derive(Deserialize)]
 pub struct CoinOnly {
     coin: String,
+}
+
+/// `l2Diff` is shaped like `l4Book`: an externally tagged enum in `data`, so
+/// the opening snapshot and the increments arrive under different keys. Both
+/// carry the same head, and everything past it -- the levels, the changed
+/// prices -- is skipped by serde without being materialised.
+#[derive(Deserialize)]
+pub enum L2DiffFrame {
+    Snapshot(L2DiffHead),
+    Updates(L2DiffHead),
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct L2DiffHead {
+    coin: String,
+    height: u64,
+    #[serde(default)]
+    n_sig_figs: Option<u32>,
+    #[serde(default)]
+    n_levels: Option<usize>,
+    #[serde(default)]
+    mantissa: Option<u64>,
+}
+
+impl L2DiffHead {
+    fn key(self) -> SubKey {
+        SubKey::L2Diff {
+            coin: self.coin,
+            n_sig_figs: self.n_sig_figs,
+            n_levels: self.n_levels,
+            mantissa: self.mantissa,
+        }
+    }
 }
 
 /// `l4Book` carries an externally tagged enum in `data`, so the snapshot and
@@ -415,6 +480,19 @@ fn route_raw(frame: Frame) -> Option<(SubKey, Seq)> {
             Some((SubKey::L4Book { coin }, Seq::Snapshot(height)))
         }
 
+        // The one channel whose frames are not self-contained: an increment
+        // means something only against the book it was computed from. Two nodes
+        // measurably do not hold the same book, so the stream is carried by one
+        // source from end to end rather than raced -- see `Seq::Sticky`.
+        Frame::L2Diff(L2DiffFrame::Snapshot(d)) => {
+            let height = d.height;
+            Some((d.key(), Seq::Snapshot(height)))
+        }
+        Frame::L2Diff(L2DiffFrame::Updates(d)) => {
+            let height = d.height;
+            Some((d.key(), Seq::Sticky(height)))
+        }
+
         // `Updates` carries no coin of its own. The upstream fills exactly one
         // of the two arrays and only enters that branch for a non-empty
         // per-coin group, so one of them always yields the coin.
@@ -443,6 +521,7 @@ mod tests {
             Seq::Block(v) => (key, v, "block"),
             Seq::Snapshot(v) => (key, v, "snapshot"),
             Seq::Lead(v) => (key, v, "lead"),
+            Seq::Sticky(v) => (key, v, "sticky"),
         })
     }
 

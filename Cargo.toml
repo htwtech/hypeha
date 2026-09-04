@@ -11,7 +11,9 @@ description = "Websocket arbitration proxy for multiple Hyperliquid sources"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-tokio-tungstenite = "0.26"
+# TLS, so the load test can reach wsarb through nginx over wss:// rather than
+# only on the loopback port. Needs libssl-dev and pkg-config on the build host.
+tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
 futures-util = "0.3"
 axum = { version = "0.8", features = ["ws"] }
 serde = { version = "1", features = ["derive"] }

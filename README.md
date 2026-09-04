@@ -27,6 +27,7 @@ sources lag or drop.
 |---------|-----------|-----|
 | `bbo` | block `time`, one source per stamp | coin |
 | `l2Book` | block `time`, one source per stamp | coin + `nSigFigs`/`nLevels`/`mantissa` |
+| `l2Diff` | block `height`, one source throughout | coin + `nSigFigs`/`nLevels`/`mantissa` |
 | `trades` | `tid` | coin |
 | `orderUpdates` | `height` | user |
 | `l4Book` | block `height` | coin |
@@ -65,6 +66,8 @@ frame from a source socket
 |---|---|---|---|
 | `bbo` | coin | `data.time` | Lead |
 | `l2Book` | coin + `nSigFigs`/`nLevels`/`mantissa` | `data.time` | Lead |
+| `l2Diff` / `Snapshot` | coin + params | `height` | Snapshot |
+| `l2Diff` / `Updates` | coin + params | `height` | Sticky |
 | `trades` | coin | **max** `tid` in the batch | Point |
 | `orderUpdates` | user, lower-cased | **max** `height` in the batch | Block |
 | `l4Book` / `Snapshot` | coin | `height` | Snapshot |
@@ -118,6 +121,34 @@ baselines of 0.0% and 0.6% between two connections to one node.
 The client follows one source through a stamp, so the book only ever moves
 forward. The stamp is taken afresh by whoever opens the next one, so a source
 that dies costs at most the rest of the block it was holding.
+
+#### Sticky — one source carries the whole stream
+
+`l2Diff` only: the same book as `l2Book`, sent as one snapshot followed by only
+what changed. At 1000 levels that is around a hundredfold less traffic, which is
+the whole reason the channel exists.
+
+It is also the one channel whose frames are **not self-contained**. An increment
+means something only against the book it was computed from, and two nodes
+measurably do not hold the same book: 17% of levels apart at depth 100, 36% at
+1000, measured on stock binaries and on `l2Book` itself, so this is a property
+of the upstream rather than of this channel. Applying one node's increment to
+another node's book therefore corrupts it silently and permanently.
+
+So the leader is not re-elected per stamp as in Lead. It is chosen once and
+holds the stream until it dies.
+
+| Condition | Action |
+|---|---|
+| no leader yet | this source takes the stream, fanned out |
+| leader, `v >= last` | fanned out — a further flush of the same block is a further increment, not a repeat |
+| leader, `v < last` | it replayed: stale, dropped |
+| anyone else | lateness recorded, **never** forwarded |
+
+When the leader dies the clients are parked and rebuilt from a fresh snapshot,
+by the same path `l4Book` uses. Their book jumps to the replacement node's
+version — the jump is real, but the alternative is not "no jump", it is a book
+quietly spliced together from two different ones.
 
 #### Block — positions raced within one stamp
 

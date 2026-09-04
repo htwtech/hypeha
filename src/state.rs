@@ -35,6 +35,17 @@ pub enum SubKey {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         mantissa: Option<u64>,
     },
+    /// The same book and the same parameters as [`SubKey::L2Book`], but sent as
+    /// one snapshot followed by only what changed.
+    L2Diff {
+        coin: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        n_sig_figs: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        n_levels: Option<usize>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mantissa: Option<u64>,
+    },
     L4Book {
         coin: String,
     },
@@ -61,6 +72,7 @@ impl SubKey {
         match self {
             Self::Trades { .. } => "trades",
             Self::L2Book { .. } => "l2Book",
+            Self::L2Diff { .. } => "l2Diff",
             Self::L4Book { .. } => "l4Book",
             Self::Bbo { .. } => "bbo",
             Self::OrderUpdates { .. } => "orderUpdates",
@@ -88,6 +100,12 @@ impl SubKey {
                 n_levels: n_levels.filter(|&n| n != DEFAULT_L2_LEVELS),
                 mantissa,
             },
+            Self::L2Diff { coin, n_sig_figs, n_levels, mantissa } => Self::L2Diff {
+                coin,
+                n_sig_figs,
+                n_levels: n_levels.filter(|&n| n != DEFAULT_L2_LEVELS),
+                mantissa,
+            },
             other => other,
         }
     }
@@ -95,7 +113,7 @@ impl SubKey {
     /// Whether the channel streams increments against a prior snapshot, so that
     /// a dropped or out-of-order frame corrupts the client's book for good.
     pub fn is_incremental(&self) -> bool {
-        matches!(self, Self::L4Book { .. })
+        matches!(self, Self::L4Book { .. } | Self::L2Diff { .. })
     }
 
     /// Compact one-line label for the stats page.
@@ -108,8 +126,9 @@ impl SubKey {
                 let short = if user.len() > 10 { format!("{}…{}", &user[..6], &user[user.len() - 4..]) } else { user.clone() };
                 format!("orderUpdates:{short}")
             }
-            Self::L2Book { coin, n_sig_figs, n_levels, mantissa } => {
-                let mut s = format!("l2Book:{coin}");
+            Self::L2Book { coin, n_sig_figs, n_levels, mantissa }
+            | Self::L2Diff { coin, n_sig_figs, n_levels, mantissa } => {
+                let mut s = format!("{}:{coin}", self.channel());
                 if let Some(v) = n_sig_figs {
                     s.push_str(&format!("/sf{v}"));
                 }
@@ -161,6 +180,16 @@ pub enum Seq {
     /// all. Instead the first source to open a stamp carries it to the end:
     /// its own later snapshots go out, everyone else's are duplicates.
     Lead(u64),
+    /// One source carries the whole stream, not merely one stamp.
+    ///
+    /// An increment only means anything against the book it was computed from,
+    /// and two nodes measurably do not hold the same book: 17% of levels apart
+    /// at depth 100, 36% at 1000, measured on stock binaries and on `l2Book`
+    /// itself. Applying one node's increment to another node's book therefore
+    /// corrupts it, silently and for good. So the leader changes only when it
+    /// dies, and the client is moved to its replacement by a fresh snapshot
+    /// rather than by splicing.
+    Sticky(u64),
     /// A full snapshot at a block height. A reset rather than an increment, and
     /// the only thing that puts a source back in play after it was written off.
     Snapshot(u64),
@@ -533,6 +562,35 @@ impl AppState {
                     stale = true;
                 }
             }
+            Seq::Sticky(v) => match entry.block_leader {
+                // Nobody is leading: the first source to speak takes the stream
+                // and keeps it. This is also the path back after a resync.
+                None => {
+                    entry.last = v;
+                    entry.last_seen_at = now;
+                    entry.block_leader = Some(src.id);
+                    deliver = true;
+                    win = true;
+                }
+                Some(id) if id == src.id => {
+                    if v >= entry.last {
+                        // Equal stamps are ordinary here: the upstream flushes
+                        // more than once per block, and each flush is a further
+                        // increment on the same book, not a repeat.
+                        win = v > entry.last;
+                        entry.last = v;
+                        entry.last_seen_at = now;
+                        deliver = true;
+                    } else {
+                        // The leader replayed. Its increments no longer line up
+                        // with what the client holds.
+                        stale = true;
+                    }
+                }
+                // Somebody else's increments are computed against a different
+                // book. Not a race to win -- just not usable.
+                Some(_) => late = Some(now.saturating_duration_since(entry.last_seen_at)),
+            },
             Seq::Snapshot(h) => {
                 // A snapshot is a reset, and the one thing that puts a written
                 // off source back in play.
@@ -865,6 +923,59 @@ mod tests {
 
     fn msg(s: &str) -> Utf8Bytes {
         Utf8Bytes::from(s.to_string())
+    }
+
+    #[test]
+    fn the_leader_carries_the_whole_stream_not_just_a_stamp() {
+        let state = test_state(2);
+        let key = SubKey::L2Diff { coin: "BTC".into(), n_sig_figs: None, n_levels: None, mantissa: None };
+        let (client, mut rx) = state.register_client("t".into());
+        state.subscribe(&client, key.clone());
+
+        let a = state.sources[0].clone();
+        let b = state.sources[1].clone();
+
+        state.on_update(&a, key.clone(), Seq::Sticky(10), msg("10-a"));
+        state.on_update(&b, key.clone(), Seq::Sticky(10), msg("10-b")); // other book
+        state.on_update(&a, key.clone(), Seq::Sticky(10), msg("10-a2")); // same stamp, next flush
+        state.on_update(&b, key.clone(), Seq::Sticky(11), msg("11-b")); // ahead, still not ours
+        state.on_update(&a, key.clone(), Seq::Sticky(11), msg("11-a"));
+        state.on_update(&a, key.clone(), Seq::Sticky(10), msg("10-a3")); // a replayed
+
+        // Only A. Under Lead, "11-b" would have taken the stamp and the client
+        // would have applied B's increment to A's book -- the two nodes hold
+        // books that differ by a third at depth, so that silently corrupts it.
+        assert_eq!(drain(&mut rx), vec!["10-a", "10-a2", "11-a"]);
+        assert_eq!(b.stats.wins.load(Relaxed), 0);
+        assert_eq!(a.stats.stale.load(Relaxed), 1);
+    }
+
+    #[test]
+    fn losing_the_leader_parks_l2diff_clients_for_a_rebuild() {
+        let state = test_state(2);
+        let key = SubKey::L2Diff { coin: "BTC".into(), n_sig_figs: None, n_levels: None, mantissa: None };
+        let (client, mut rx) = state.register_client("t".into());
+        state.subscribe(&client, key.clone());
+
+        let a = state.sources[0].clone();
+        let b = state.sources[1].clone();
+
+        state.on_update(&a, key.clone(), Seq::Snapshot(10), msg("snap-a"));
+        state.on_update(&a, key.clone(), Seq::Sticky(12), msg("12-a"));
+        assert_eq!(drain(&mut rx), vec!["snap-a", "12-a"]);
+
+        // The channel is incremental, so the loss of its leader has to reach
+        // the same machinery l4Book uses rather than passing unnoticed.
+        let work = state.resync_after_source_loss(a.id);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].0, key);
+
+        // Parked until it has a snapshot of its own. B's frames are held, not
+        // delivered: applying B's increment to the book A built is exactly the
+        // corruption this mode exists to prevent.
+        state.on_update(&b, key.clone(), Seq::Snapshot(11), msg("snap-b"));
+        state.on_update(&b, key.clone(), Seq::Sticky(12), msg("12-b"));
+        assert!(drain(&mut rx).is_empty());
     }
 
     #[test]

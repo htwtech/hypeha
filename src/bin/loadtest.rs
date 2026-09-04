@@ -33,7 +33,7 @@ use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::Message as TMessage;
 
 use wsarb::state::{Seq, SubKey, SubRequest};
-use wsarb::upstream::{connect, route, Frame};
+use wsarb::upstream::{connect_with, route, Frame};
 
 /// wsarb, the comparison nodes, and the noise-floor twin. Fixed so that the
 /// per-message record is a plain array rather than a heap allocation each.
@@ -105,6 +105,16 @@ struct Args {
 
     #[arg(long, default_value_t = 10.0)]
     progress: f64,
+
+    /// Book depth for `l2Book` and `l2Diff`. Ignored by every other channel.
+    #[arg(long, default_value_t = 20)]
+    levels: usize,
+
+    /// `x-token` to present on connect, for reaching wsarb through a gateway
+    /// that authenticates. Sent on every stream; a node reached directly
+    /// ignores the header.
+    #[arg(long)]
+    token: Option<String>,
 }
 
 fn hash_of(text: &str) -> u64 {
@@ -317,7 +327,7 @@ impl KeyStats {
     fn order(&mut self, seq: Seq, label: &str) {
         match seq {
             Seq::Snapshot(_) => self.last_seq = None,
-            Seq::Point(v) | Seq::Block(v) | Seq::Lead(v) => {
+            Seq::Point(v) | Seq::Block(v) | Seq::Lead(v) | Seq::Sticky(v) => {
                 if let Some(prev) = self.last_seq {
                     // Gaps are not violations: with nothing happening for a coin
                     // in a block the upstream sends nothing for it at all.
@@ -506,6 +516,7 @@ struct StreamCtx {
     ramp: f64,
     stall_factor: f64,
     seconds: f64,
+    token: Option<String>,
 }
 
 /// Adds the time spent in its scope to a counter, by whatever path the scope is
@@ -529,9 +540,12 @@ fn note_end(stream: &Stream, at: Duration, seconds: f64, reason: String) {
 }
 
 async fn run_stream(mut ctx: StreamCtx) {
-    let Some(ws) = connect(&ctx.url).await else {
-        eprintln!("[slot {}] could not connect to {}", ctx.slot, ctx.url);
-        return;
+    let ws = match connect_with(&ctx.url, ctx.token.as_deref()).await {
+        Ok(ws) => ws,
+        Err(e) => {
+            eprintln!("[slot {}] could not connect to {}: {}", ctx.slot, ctx.url, e);
+            return;
+        }
     };
     let (mut write, mut read) = ws.split();
 
@@ -607,7 +621,7 @@ async fn run_stream(mut ctx: StreamCtx) {
         let Some((key, seq)) = route(frame) else { continue };
         let label = key.label();
         let seq_val = match seq {
-            Seq::Point(v) | Seq::Block(v) | Seq::Snapshot(v) | Seq::Lead(v) => v,
+            Seq::Point(v) | Seq::Block(v) | Seq::Snapshot(v) | Seq::Lead(v) | Seq::Sticky(v) => v,
         };
 
         let age = {
@@ -659,7 +673,9 @@ async fn run_stream(mut ctx: StreamCtx) {
         // count.
         let stamp = match seq {
             Seq::Block(h) => Some((h, true)),
-            Seq::Lead(h) => Some((h, false)),
+            // Led, not raced: counted for the stamp report, but a divergence
+            // there is expected rather than alarming.
+            Seq::Lead(h) | Seq::Sticky(h) => Some((h, false)),
             Seq::Point(_) | Seq::Snapshot(_) => None,
         };
         if let (Some((h, raced)), true) = (stamp, key_idx != u32::MAX) {
@@ -832,14 +848,23 @@ async fn sweeper(
     }
 }
 
-fn parse_sub(spec: &str) -> Option<SubKey> {
+fn parse_sub(spec: &str, levels: usize) -> Option<SubKey> {
     let (channel, key) = spec.split_once(':')?;
+    // The upstream refuses an explicit 20 -- that is its default, asked for by
+    // leaving the field out.
+    let n_levels = (levels != 20).then_some(levels);
     Some(match channel {
         "bbo" => SubKey::Bbo { coin: key.into() },
         "l2Book" => SubKey::L2Book {
             coin: key.into(),
             n_sig_figs: None,
-            n_levels: None,
+            n_levels,
+            mantissa: None,
+        },
+        "l2Diff" => SubKey::L2Diff {
+            coin: key.into(),
+            n_sig_figs: None,
+            n_levels,
             mantissa: None,
         },
         "l4Book" => SubKey::L4Book { coin: key.into() },
@@ -878,13 +903,13 @@ fn main() -> anyhow::Result<()> {
         }
     }
     for coin in &coins {
-        match parse_sub(&format!("{}:{}", args.channel, coin)) {
+        match parse_sub(&format!("{}:{}", args.channel, coin), args.levels) {
             Some(k) => subs.push(k),
             None => anyhow::bail!("unknown channel {}", args.channel),
         }
     }
     for spec in &args.subs {
-        match parse_sub(spec) {
+        match parse_sub(spec, args.levels) {
             Some(k) => subs.push(k),
             None => anyhow::bail!("cannot parse subscription {spec}"),
         }
@@ -917,6 +942,14 @@ fn main() -> anyhow::Result<()> {
         if noise_slot.is_some() { " + noise-floor twin" } else { "" },
         args.seconds
     );
+    // Which endpoint was measured, and whether a token was presented.
+    // Without this the report cannot say whether a run went through the
+    // gateway or straight to the loopback port, and those differ.
+    println!(
+        "wsarb at {}{}",
+        args.url,
+        if args.token.is_some() { " (with x-token)" } else { "" }
+    );
     println!("each stream on its own thread and runtime\n");
 
     let start = Instant::now();
@@ -942,6 +975,7 @@ fn main() -> anyhow::Result<()> {
         ramp: args.ramp,
         stall_factor: args.stall_factor,
         seconds: args.seconds,
+        token: args.token.clone(),
     };
 
     let matched_ages: Arc<Mutex<Vec<Vec<u32>>>> =
@@ -1093,13 +1127,45 @@ fn main() -> anyhow::Result<()> {
         let keys = stream.keys.lock().unwrap();
         let mut names: Vec<&String> = keys.keys().collect();
         names.sort();
-        let width = names.iter().map(|n| n.len()).max().unwrap_or(0);
-        for name in &names {
+        // One strip per subscription is the point of this section, but at every
+        // market it is 176 of them per stream and the report stops being
+        // readable — or even pasteable. Past the cap, show the ones with
+        // something wrong and say how many were left out.
+        const MAX_STRIPS: usize = 12;
+        let mut shown: Vec<&String> = names.clone();
+        if names.len() > MAX_STRIPS {
+            shown.sort_by_key(|n| {
+                let k = &keys[*n];
+                // Worst first: stalls, then staleness.
+                (std::cmp::Reverse(k.stall_count), std::cmp::Reverse(k.age_pct(0.50).unwrap_or(0)))
+            });
+            shown.truncate(MAX_STRIPS);
+            shown.sort();
+        }
+        let width = shown.iter().map(|n| n.len()).max().unwrap_or(0);
+        for name in &shown {
             let k = &keys[*name];
             // Per-subscription age matters once there are many coins: a single
             // lagging market is invisible in the aggregate.
             let age = k.age_pct(0.50).map_or_else(|| "    —".into(), |m| format!("{m:>5}"));
             println!("{:width$}  {}  {age} ms", name, heat(&k.per_second, secs, &alive));
+        }
+        if names.len() > shown.len() {
+            println!(
+                "{:width$}  ({} more not shown; these are the {} with the most stalls)",
+                "",
+                names.len() - shown.len(),
+                shown.len()
+            );
+            // The aggregate still has to be there, or a break that hits every
+            // subscription at once would vanish along with the strips.
+            let mut all = vec![0u32; secs];
+            for k in keys.values() {
+                for (i, n) in k.per_second.iter().enumerate().take(secs) {
+                    all[i] += n;
+                }
+            }
+            println!("{:width$}  {}   all", "ALL", heat(&all, secs, &alive));
         }
         let msgs: u64 = keys.values().map(|k| k.msgs).sum();
         let mb: f64 = (keys.values().map(|k| k.bytes as f64).sum::<f64>() / 1e6).max(0.0);
@@ -1554,58 +1620,59 @@ mean age per {BUCKET}s, in order:");
             // `None` until a pair has actually been compared. Without this a run
             // with a single --compare and no twin printed the conclusion that
             // everything agreed, having compared nothing at all.
-            let mut worst: Option<f64> = None;
-            let mut pair = |label: &str, agree: u64, differ: u64| {
+            let pair = |label: &str, agree: u64, differ: u64| -> Option<f64> {
                 if agree + differ == 0 {
-                    return;
+                    return None;
                 }
                 let pc = differ as f64 * 100.0 / (agree + differ) as f64;
-                worst = Some(worst.map_or(pc, |w: f64| w.max(pc)));
                 println!("{label:<28} agree {agree}, differ {differ}  ({pc:.2}% differ)");
+                Some(pc)
             };
-            pair(
+            let same = pair(
                 "same node, two connections:",
                 verdict.blk_same_agree[mode].load(Relaxed),
                 verdict.blk_same_differ[mode].load(Relaxed),
             );
-            pair(
+            let cross = pair(
                 "two different nodes:",
                 verdict.blk_cross_agree[mode].load(Relaxed),
                 verdict.blk_cross_differ[mode].load(Relaxed),
             );
 
-            // The same disagreement means opposite things in the two modes, so
-            // the reading has to be split too.
-            match (worst, mode) {
-                (None, _) => {
-                    println!("  nothing was compared: this needs two --compare nodes, or");
-                    println!("  --noise-floor for a second connection to the same one.");
+            // Read against the same-node figure, never against a constant. Two
+            // connections to one node see the same events by construction, so
+            // whatever they disagree about is the floor of this measurement —
+            // and under a struggling upstream that floor climbs into double
+            // digits and swamps the thing being looked for.
+            match (cross, same, mode) {
+                (None, _, _) | (_, None, _) => {
+                    println!("  nothing to compare against: this needs two --compare nodes AND");
+                    println!("  --noise-floor, or the cross-node figure has no baseline.");
                 }
-                // Led: the sources are *expected* to disagree. That is the whole
-                // reason the channel is led rather than raced, and a large share
-                // here confirms the choice instead of undermining it.
-                (Some(w), 0) if w >= 10.0 => {
+                (Some(_), Some(base), _) if base > 2.0 => {
+                    println!("  Two connections to ONE node disagree by {base:.1}%, so the node is not");
+                    println!("  serving its connections alike — it is struggling. Nothing here says");
+                    println!("  anything about how blocks are cut until that figure is near zero.");
+                }
+                // Led: the sources are *expected* to disagree.
+                (Some(x), Some(base), 0) if x > base * 3.0 => {
                     println!("  The nodes cut this channel differently — as expected, since it is");
                     println!("  flushed on each node's own timer. That is exactly why one source");
                     println!("  carries a stamp to the end here instead of positions being raced.");
                 }
-                (Some(_), 0) => {
+                (Some(_), Some(_), 0) => {
                     println!("  The nodes happen to agree closely here, but the mode does not rely");
                     println!("  on it: one source carries each stamp regardless.");
                 }
-                (Some(w), _) if w < 1.0 => {
-                    println!("  Stamps are cut the same way everywhere, so racing positions across");
-                    println!("  sources is sound, and the frames missing above were lost in stalls.");
+                (Some(x), Some(base), _) if x <= base * 3.0 => {
+                    println!("  Cross-node disagreement ({x:.2}%) is within reach of the {base:.2}% floor");
+                    println!("  between two connections to one node, so racing positions is sound.");
                 }
-                (Some(w), _) if w < 10.0 => {
-                    println!("  A small share differs — consistent with the stalls listed above.");
-                    println!("  Compare it against the number of stalls before reading more into it.");
-                }
-                (Some(_), _) => {
-                    println!("  A large share differs, which stalls cannot account for. Position #k");
-                    println!("  is then not the same event on two sources, and racing them splices");
-                    println!("  incompatible batches: these channels must go back to one source");
-                    println!("  carrying a whole stamp.");
+                (Some(x), Some(base), _) => {
+                    println!("  Cross-node disagreement ({x:.2}%) is far above the {base:.2}% floor, so");
+                    println!("  position #k is not the same event on two sources and racing them");
+                    println!("  splices incompatible batches: these channels must go back to one");
+                    println!("  source carrying a whole stamp.");
                 }
             }
         }
