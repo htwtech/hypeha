@@ -462,7 +462,12 @@ fn route_raw(frame: Frame) -> Option<(SubKey, Seq)> {
                 n_levels: d.n_levels,
                 mantissa: d.mantissa,
             },
-            Seq::Lead(d.time),
+            // Sticky, not Lead: Lead re-elects on every stamp, and with the
+            // nodes 15% of levels apart even at depth 20, that swapped the
+            // client's book between two of them ten-odd times a second. Every
+            // frame is a whole book, so nothing breaks either way -- but a book
+            // that stays with one node beats one a few milliseconds fresher.
+            Seq::Sticky(d.time),
         )),
 
         // Batched channels: the coin is per element, and the batch is ordered by
@@ -593,7 +598,7 @@ mod tests {
             key,
             SubKey::L2Book { coin: "BTC".into(), n_sig_figs: Some(3), n_levels: Some(50), mantissa: Some(5) }
         );
-        assert_eq!(kind, "lead");
+        assert_eq!(kind, "sticky");
     }
 
     #[test]

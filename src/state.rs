@@ -125,7 +125,7 @@ impl SubKey {
     /// would move the client across mid-stream -- silently, since both books are
     /// internally consistent.
     pub fn single_sourced(&self) -> bool {
-        matches!(self, Self::L2Diff { .. })
+        matches!(self, Self::L2Diff { .. } | Self::L2Book { .. })
     }
 
     /// Whether the channel streams increments against a prior snapshot, so that
@@ -820,7 +820,20 @@ impl AppState {
     pub fn resync_after_source_loss(&self, source_id: usize) -> Vec<(SubKey, u64)> {
         let mut work = Vec::new();
         for mut entry in self.subs.iter_mut() {
-            if !entry.key().is_incremental() || entry.block_leader != Some(source_id) {
+            if entry.block_leader != Some(source_id) {
+                continue;
+            }
+            if !entry.key().is_incremental() {
+                // A self-contained channel needs no rebuild -- the next frame
+                // from whoever takes over is a whole book. It does need the
+                // leadership freed, or a single-sourced key would follow a dead
+                // source for as long as it stays dead. The height goes with it,
+                // for the reason spelled out below.
+                if entry.key().single_sourced() {
+                    entry.block_leader = None;
+                    entry.block_sampled = 0;
+                    entry.last = 0;
+                }
                 continue;
             }
             let key = entry.key().clone();
@@ -1011,6 +1024,33 @@ mod tests {
         assert_eq!(drain(&mut rx), vec!["10-a", "10-a2", "11-a"]);
         assert_eq!(b.stats.wins.load(Relaxed), 0);
         assert_eq!(a.stats.stale.load(Relaxed), 1);
+    }
+
+    #[test]
+    fn losing_the_leader_frees_a_self_contained_stream_without_parking() {
+        let state = test_state(2);
+        let key = l2("BTC", None);
+        let (client, mut rx) = state.register_client("t".into());
+        state.subscribe(&client, key.clone());
+
+        let a = state.sources[0].clone();
+        let b = state.sources[1].clone();
+
+        state.on_update(&a, key.clone(), Seq::Sticky(10), msg("10-a"));
+        state.on_update(&b, key.clone(), Seq::Sticky(11), msg("11-b"));
+        assert_eq!(drain(&mut rx), vec!["10-a"], "only the leader's frames go out");
+
+        // `a` dies. There is nothing to rebuild -- every l2Book frame is a whole
+        // book -- but the leadership has to be freed, or the key follows a
+        // corpse for as long as it stays dead.
+        let work = state.resync_after_source_loss(a.id);
+        assert!(work.is_empty(), "a self-contained channel needs no snapshot fetch");
+
+        // `b` takes over on its next frame even though it sits *below* where `a`
+        // had got to: a spare kept on a slower peer usually does, and holding
+        // the dead leader's height would leave every frame it sends stale.
+        state.on_update(&b, key.clone(), Seq::Sticky(9), msg("9-b"));
+        assert_eq!(drain(&mut rx), vec!["9-b"]);
     }
 
     #[test]

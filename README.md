@@ -26,7 +26,7 @@ sources lag or drop.
 | Channel | Ordered by | Key |
 |---------|-----------|-----|
 | `bbo` | block `time`, one source per stamp | coin |
-| `l2Book` | block `time`, one source per stamp | coin + `nSigFigs`/`nLevels`/`mantissa` |
+| `l2Book` | block `time`, one source throughout | coin + `nSigFigs`/`nLevels`/`mantissa` |
 | `l2Diff` | block `height`, one source throughout | coin + `nSigFigs`/`nLevels`/`mantissa` |
 | `trades` | `tid` | coin |
 | `orderUpdates` | `height` | user |
@@ -65,7 +65,7 @@ frame from a source socket
 | Channel | Key | Ordering value | Mode |
 |---|---|---|---|
 | `bbo` | coin | `data.time` | Lead |
-| `l2Book` | coin + `nSigFigs`/`nLevels`/`mantissa` | `data.time` | Lead |
+| `l2Book` | coin + `nSigFigs`/`nLevels`/`mantissa` | `data.time` | Sticky |
 | `l2Diff` / `Snapshot` | coin + params | `height` | Snapshot |
 | `l2Diff` / `Updates` | coin + params | `height` | Sticky |
 | `trades` | coin | **max** `tid` in the batch | Point |
@@ -95,21 +95,21 @@ Each repeat is counted separately.
 
 #### Lead — one source carries a stamp
 
-`l2Book` and `bbo`: the two channels the upstream **dedups before sending**.
+`bbo` only: a channel the upstream **dedups before sending**.
 
-Both stamp their frames with the block, so a block's several frames share a
-stamp and differ in content, and newest-wins kept the **first** — the staler of
-them. That cost `l2Book` about one update in six and `bbo` some nine in ten.
+It stamps its frames with the block, so a block's several frames share a stamp
+and differ in content, and newest-wins kept the **first** — the staler of them.
+That cost `bbo` some nine updates in ten.
 
-Racing positions, as below, would be wrong for either. `l2Book` is flushed on a
-50 ms timer whose phase is each node's own; `bbo` is suppressed whenever its
-values repeat what that connection was last sent. In both cases how many frames
-a block contains stops being a property of the data, so position #k is not the
-same state on two sources.
+Racing positions, as below, would be wrong here: `bbo` is suppressed whenever
+its values repeat what that connection was last sent, so how many frames a block
+contains stops being a property of the data and position #k is not the same
+state on two sources. Measured, not assumed — two different nodes disagreed on a
+stamp's message count for **7%** of `bbo` stamps against a 0.6% baseline within
+one node.
 
-That is measured, not assumed. Two different nodes disagreed on a stamp's
-message count for **18%** of `l2Book` stamps and **7%** of `bbo` stamps, against
-baselines of 0.0% and 0.6% between two connections to one node.
+`l2Book` was here too until the nodes were measured against each other; it is
+now Sticky, below.
 
 | Condition | Action |
 |---|---|
@@ -124,16 +124,23 @@ that dies costs at most the rest of the block it was holding.
 
 #### Sticky — one source carries the whole stream
 
-`l2Diff` only: the same book as `l2Book`, sent as one snapshot followed by only
-what changed. At 1000 levels that is around a hundredfold less traffic, which is
-the whole reason the channel exists.
+`l2Diff` and `l2Book` — the same book, sent two ways.
 
-It is also the one channel whose frames are **not self-contained**. An increment
-means something only against the book it was computed from, and two nodes
-measurably do not hold the same book: 17% of levels apart at depth 100, 36% at
-1000, measured on stock binaries and on `l2Book` itself, so this is a property
-of the upstream rather than of this channel. Applying one node's increment to
-another node's book therefore corrupts it silently and permanently.
+Both are here for one measured reason: **the two nodes do not hold the same
+book.** 15% of levels apart at depth 20, 17% at 100, 36% at 1000, on stock
+binaries and on `l2Book` itself, so it is a property of the upstream and not of
+anything here. Lead re-elects on every stamp, which meant swapping the client's
+book between two of them ten-odd times a second.
+
+For `l2Diff` that is fatal rather than merely untidy. Its frames are the only
+ones here that are **not self-contained**: an increment means something only
+against the book it was computed from, so laying one node's increment on
+another's corrupts it silently and for good.
+
+For `l2Book` every frame is a whole book, so nothing breaks either way. It is
+Sticky because a book that stays with one node beats one a few milliseconds
+fresher — at depth the swapping showed up as liquidity appearing and vanishing
+with no trade behind it.
 
 So the leader is not re-elected per stamp as in Lead. It is chosen once and
 holds the stream until it dies.
@@ -145,9 +152,14 @@ holds the stream until it dies.
 | leader, `v < last` | it replayed: stale, dropped |
 | anyone else | lateness recorded, **never** forwarded |
 
-When the leader dies the clients are parked and rebuilt from a fresh snapshot,
-by the same path `l4Book` uses. Their book jumps to the replacement node's
-version — the jump is real, but the alternative is not "no jump", it is a book
+When the leader dies, `l2Diff` clients are parked and rebuilt from a fresh
+snapshot by the same path `l4Book` uses; `l2Book` needs none of that, since the
+next frame from whoever takes over is already a whole book — only the leadership
+is freed, along with the height, because the surviving source is often the
+slower spare and would otherwise look stale for seconds.
+
+Either way the book jumps to the replacement node's version — the jump is real,
+but the alternative is not "no jump", it is a book
 quietly spliced together from two different ones.
 
 #### Block — positions raced within one stamp
