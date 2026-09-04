@@ -601,7 +601,15 @@ impl AppState {
                 // A snapshot is a reset, and the one thing that puts a written
                 // off source back in play.
                 entry.needs_snapshot &= !source_bit(src.id);
-                if h > entry.last {
+                // ...but only from the source we are following, or from anyone
+                // when we are following nobody. Every source snapshots when it
+                // subscribes and again on every reconnect, so an unguarded
+                // reset let a source that happened to be a block ahead seize
+                // the stream from a healthy leader -- moving the client onto a
+                // different node's book behind its back, which is the one thing
+                // `Seq::Sticky` exists to prevent.
+                let ours = entry.block_leader.map_or(true, |id| id == src.id);
+                if ours && h > entry.last {
                     entry.last = h;
                     entry.last_seen_at = now;
                     entry.block_leader = Some(src.id);
@@ -970,6 +978,30 @@ mod tests {
         assert_eq!(drain(&mut rx), vec!["10-a", "10-a2", "11-a"]);
         assert_eq!(b.stats.wins.load(Relaxed), 0);
         assert_eq!(a.stats.stale.load(Relaxed), 1);
+    }
+
+    #[test]
+    fn a_reconnecting_source_does_not_steal_a_healthy_stream() {
+        let state = test_state(2);
+        let key = SubKey::L2Diff { coin: "BTC".into(), n_sig_figs: None, n_levels: None, mantissa: None };
+        let (client, mut rx) = state.register_client("t".into());
+        state.subscribe(&client, key.clone());
+
+        let a = state.sources[0].clone();
+        let b = state.sources[1].clone();
+
+        state.on_update(&a, key.clone(), Seq::Snapshot(10), msg("snap-a"));
+        state.on_update(&a, key.clone(), Seq::Sticky(11), msg("11-a"));
+
+        // B reconnects and snapshots, a block ahead of the leader. Taking that
+        // as a reset would hand it the stream and move the client onto B's
+        // book -- silently, since both books are internally consistent.
+        state.on_update(&b, key.clone(), Seq::Snapshot(12), msg("snap-b"));
+        state.on_update(&b, key.clone(), Seq::Sticky(13), msg("13-b"));
+        state.on_update(&a, key.clone(), Seq::Sticky(12), msg("12-a"));
+
+        assert_eq!(drain(&mut rx), vec!["snap-a", "11-a", "12-a"]);
+        assert_eq!(b.stats.wins.load(Relaxed), 0);
     }
 
     #[test]
