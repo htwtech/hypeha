@@ -162,6 +162,7 @@ class Stream(threading.Thread):
         self.books = {}         # time -> whole book
         self.sigs = {}          # time -> signature
         self.frames = self.snapshots = 0
+        self.last_t = None      # newest time recorded, for the live readout
         self.error = None
 
     def run(self):
@@ -206,6 +207,7 @@ class Stream(threading.Thread):
         snap = [dict(book[0]), dict(book[1])]
         self.books[t] = snap
         self.sigs[t] = signature(snap)
+        self.last_t = t
 
 
 def main():
@@ -236,6 +238,24 @@ def main():
           .format(args.coin, args.levels, args.seconds))
     for s in (w, a, b):
         s.start()
+
+    # Which node wsarb is following, live. Without this the failover test is
+    # guesswork: the leader is whoever answered first, so it differs from run to
+    # run, and there is no telling which node to stop.
+    while _time.time() < deadline:
+        _time.sleep(min(5.0, max(0.1, deadline - _time.time())))
+        t = w.last_t
+        if t is None:
+            print("  [{:>3.0f}s] wsarb: nothing yet".format(args.seconds - (deadline - _time.time())))
+            continue
+        # .get on a dict another thread is writing is safe here; iterating it
+        # would not be.
+        who = [name for name, s in (("A", a), ("B", b)) if s.sigs.get(t) == w.sigs.get(t)]
+        print("  [{:>3.0f}s] wsarb {} frames, following {}".format(
+            args.seconds - (deadline - _time.time()),
+            w.frames,
+            "+".join(who) if who else "NEITHER (or the nodes are behind)"))
+
     for s in (w, a, b):
         s.join()
 
