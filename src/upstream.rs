@@ -231,11 +231,16 @@ async fn snapshot_from(url: &str, key: &SubKey) -> Option<(u64, Utf8Bytes)> {
 
     while let Some(Ok(msg)) = read.next().await {
         let TMessage::Text(text) = msg else { continue };
-        if let Ok(Frame::L4Book(L4Frame::Snapshot { coin, height })) = serde_json::from_str::<Frame>(text.as_str()) {
-            // Parenthesised: a struct literal cannot start an `if` condition.
-            if (SubKey::L4Book { coin }) == *key {
-                return Some((height, Utf8Bytes::from(text.as_str().to_string())));
-            }
+        let Ok(frame) = serde_json::from_str::<Frame>(text.as_str()) else { continue };
+        // Asked of `route` rather than matched channel by channel. This used to
+        // look for an l4Book snapshot by name, so when l2Diff arrived it read
+        // frames until the timeout and then disconnected the very client it was
+        // sent to rebuild -- a channel-specific test inside a path every
+        // incremental channel depends on.
+        if let Some((found, Seq::Snapshot(height))) = route(frame)
+            && found == *key
+        {
+            return Some((height, Utf8Bytes::from(text.as_str().to_string())));
         }
     }
     None
@@ -523,6 +528,23 @@ mod tests {
             Seq::Lead(v) => (key, v, "lead"),
             Seq::Sticky(v) => (key, v, "sticky"),
         })
+    }
+
+    #[test]
+    fn l2diff_frames_route_by_key_and_kind() {
+        // `nLevels` 20 is the upstream's own default, stamped into every frame
+        // it sends back, so it has to fold away exactly as it does for l2Book --
+        // otherwise the frame's key misses the subscription's and the client is
+        // acknowledged and then hears nothing.
+        let snap = r#"{"channel":"l2Diff","data":{"Snapshot":{"coin":"BTC","time":1,"height":7,"nLevels":20,"levels":[[],[]]}}}"#;
+        let (key, h, kind) = key_of(snap).unwrap();
+        assert_eq!(key, SubKey::L2Diff { coin: "BTC".into(), n_sig_figs: None, n_levels: None, mantissa: None });
+        assert_eq!((h, kind), (7, "snapshot"));
+
+        let upd = r#"{"channel":"l2Diff","data":{"Updates":{"coin":"BTC","time":2,"height":8,"prevHeight":7,"nLevels":1000,"bids":{"upd":[],"del":[]},"asks":{"upd":[],"del":[]}}}}"#;
+        let (key, h, kind) = key_of(upd).unwrap();
+        assert_eq!(key, SubKey::L2Diff { coin: "BTC".into(), n_sig_figs: None, n_levels: Some(1000), mantissa: None });
+        assert_eq!((h, kind), (8, "sticky"));
     }
 
     #[test]
