@@ -37,6 +37,12 @@ pub enum SubKey {
     },
     /// The same book and the same parameters as [`SubKey::L2Book`], but sent as
     /// one snapshot followed by only what changed.
+    ///
+    /// The rename belongs on the variant: the one on the enum renames variants,
+    /// not fields. Without it `nLevels` never reaches `n_levels`, serde fills in
+    /// the default, and the client is served a book at some other depth than it
+    /// asked for — with an acknowledgement that looks perfectly fine.
+    #[serde(rename_all = "camelCase")]
     L2Diff {
         coin: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -862,6 +868,22 @@ mod tests {
 
         let req = SubRequest::Subscribe { subscription: &key }.json();
         assert_eq!(req, r#"{"method":"subscribe","subscription":{"type":"l2Book","coin":"BTC"}}"#);
+    }
+
+    #[test]
+    fn subscription_parameters_survive_the_round_trip() {
+        // The round-trip test above uses the bare form, with no parameters at
+        // all, so it cannot see a field-naming mistake. This one can, and it
+        // covers both channels: the names on the wire are camelCase and the
+        // fields are not, and getting that wrong fails silently -- serde fills
+        // in the default and the client is served a book at some depth other
+        // than the one it asked for, acknowledged as though nothing happened.
+        for channel in ["l2Book", "l2Diff"] {
+            let wire =
+                format!(r#"{{"type":"{channel}","coin":"BTC","nSigFigs":3,"nLevels":1000,"mantissa":5}}"#);
+            let key: SubKey = serde_json::from_str(&wire).expect(channel);
+            assert_eq!(serde_json::to_string(&key).unwrap(), wire, "{channel}");
+        }
     }
 
     #[test]
