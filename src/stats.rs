@@ -540,6 +540,41 @@ th{background:#1c1c1c}
     out.push_str(&peer_rows);
     out.push_str("</table>\n");
 
+    // Which node each subscription is served from. On a sticky channel that is
+    // the whole answer to "whose book is this client seeing", and there was no
+    // way to tell before: the per-source win counts are aggregates over every
+    // subscription at once.
+    out.push_str("<div class='cap c2'>Subscriptions &mdash; source carrying each stream</div>\n<table>\n");
+    out.push_str("<tr><th>subscription</th><th>served by</th><th>clients</th><th>rebuilding</th></tr>\n");
+    let mut subrows: Vec<(String, String, usize, usize)> = state
+        .subs
+        .iter()
+        .map(|e| {
+            let served = if e.key().single_sourced() {
+                e.leader().map_or_else(|| "&mdash;".to_string(), |id| format!("node{}", id + 1))
+            } else {
+                // A raced channel changes leader every block; naming one would
+                // read as a claim that it does not.
+                "raced".to_string()
+            };
+            (e.key().label(), served, e.subscribers.len(), e.rebuilding())
+        })
+        .collect();
+    subrows.sort();
+    if subrows.is_empty() {
+        out.push_str("<tr><td colspan=4 class=sum>no subscriptions</td></tr>\n");
+    }
+    for (label, served, clients, rebuilding) in subrows {
+        out.push_str(&format!(
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>\n",
+            html_escape(&label),
+            served,
+            clients,
+            if rebuilding == 0 { "&mdash;".to_string() } else { rebuilding.to_string() },
+        ));
+    }
+    out.push_str("</table>\n");
+
     out.push_str("<div class='cap c3'>Client connections</div>\n<table>\n");
     out.push_str("<tr><th>id</th><th>ip</th><th>subscriptions</th><th>traffic sent</th><th>dropped</th><th>age</th></tr>\n");
     if client_rows.is_empty() {

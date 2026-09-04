@@ -135,6 +135,7 @@ impl SubKey {
     }
 
     /// Compact one-line label for the stats page.
+    #[must_use]
     pub fn label(&self) -> String {
         match self {
             Self::Trades { coin } | Self::L4Book { coin } | Self::Bbo { coin } | Self::BookDiffs { coin } => {
@@ -298,7 +299,9 @@ pub struct SubEntry {
     /// Clients held back until their snapshot arrives. Normally empty, so the
     /// hot path pays one emptiness check.
     pending: Vec<Pending>,
-    /// `Seq::Block` only: the source leading the currently open block.
+    /// The source carrying this subscription. Under `Seq::Block` that is only
+    /// the currently open block; under `Seq::Sticky` it is the whole stream,
+    /// until the source dies.
     block_leader: Option<usize>,
     /// `Seq::Block` only: bitmask of sources already charged one delay sample
     /// for the open block, so a 200-message block yields one sample per source
@@ -342,6 +345,19 @@ impl Default for SubEntry {
 }
 
 impl SubEntry {
+    /// Which source is carrying this subscription right now, if any. Worth
+    /// showing on a single-sourced channel, where it holds for the life of the
+    /// stream; on a raced one it changes per block and means little.
+    pub fn leader(&self) -> Option<usize> {
+        self.block_leader
+    }
+
+    /// Clients parked awaiting a snapshot of their own. Normally zero, and
+    /// non-zero exactly during a rebuild -- which is otherwise invisible.
+    pub fn rebuilding(&self) -> usize {
+        self.pending.len()
+    }
+
     /// Count one more message of the current block from `id`, returning that
     /// source's running total for the block.
     fn bump_block_count(&mut self, id: usize) -> u32 {
