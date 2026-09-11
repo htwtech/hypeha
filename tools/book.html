@@ -1,0 +1,229 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>wsarb book</title>
+<style>
+  :root {
+    --bg: #0e1116; --panel: #151a22; --line: #232a35; --fg: #d6dbe4; --dim: #7f8794;
+    --bid: #3fb950; --ask: #f2555a; --bid-bar: rgba(63,185,80,.16); --ask-bar: rgba(242,85,90,.16);
+    --flash: rgba(255,214,102,.45); --warn: #f2c94c; --bad: #f2555a;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+         font: 13px/1.4 -apple-system, "Segoe UI", Roboto, sans-serif; }
+  .bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+         padding: 10px 14px; background: var(--panel); border-bottom: 1px solid var(--line); }
+  .bar label { color: var(--dim); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
+  .bar input, .bar select { background: var(--bg); color: var(--fg); border: 1px solid var(--line);
+         border-radius: 4px; padding: 5px 8px; font: inherit; }
+  .bar input.url { width: 260px; } .bar input.coin { width: 70px; }
+  .bar input.num { width: 60px; }
+  .bar button { background: #2b6de0; color: #fff; border: 0; border-radius: 4px;
+         padding: 6px 14px; font: inherit; cursor: pointer; }
+  .bar button.off { background: #3a4150; }
+  .status { display: flex; flex-wrap: wrap; gap: 18px; padding: 8px 14px;
+            font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; font-size: 12px;
+            color: var(--dim); border-bottom: 1px solid var(--line); }
+  .status b { color: var(--fg); font-weight: 500; }
+  .status .age.warn b { color: var(--warn); } .status .age.bad b { color: var(--bad); font-weight: 700; }
+  .status .err { color: var(--bad); font-weight: 600; }
+  .book { max-width: 620px; margin: 0 auto; padding: 8px 14px 24px;
+          font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; font-size: 12.5px;
+          font-variant-numeric: tabular-nums; }
+  .book table { width: 100%; border-collapse: collapse; }
+  .book th { color: var(--dim); font-weight: 500; font-size: 11px; text-align: right;
+             padding: 4px 8px; border-bottom: 1px solid var(--line); }
+  .book th:first-child, .book td:first-child { text-align: left; }
+  .book td { position: relative; padding: 2px 8px; text-align: right; white-space: nowrap; }
+  .book td .fill { position: absolute; inset: 0; z-index: 0; pointer-events: none; }
+  .book td span { position: relative; z-index: 1; }
+  tr.ask td.px { color: var(--ask); } tr.bid td.px { color: var(--bid); }
+  tr.flash td { animation: flash .5s ease-out; }
+  @keyframes flash { from { background: var(--flash); } to { background: transparent; } }
+  tr.spread td { text-align: center; color: var(--dim); padding: 6px 8px;
+                 border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+  @media (prefers-reduced-motion: reduce) { tr.flash td { animation: none; } }
+</style>
+</head>
+<body>
+
+<div class="bar">
+  <label>url</label>       <input class="url"  id="url"   value="ws://localhost:48000/ws">
+  <label>coin</label>      <input class="coin" id="coin"  value="BTC">
+  <label>levels</label>    <input class="num"  id="levels" placeholder="20" title="пусто = 20 (явную 20 апстрим отвергает)">
+  <label>channel</label>
+  <select id="chan"><option>l2Book</option><option>l2Diff</option></select>
+  <label>rows</label>      <input class="num"  id="rows"  value="20">
+  <button id="btn">Connect</button>
+</div>
+
+<div class="status" id="status">
+  <span>не подключено</span>
+</div>
+
+<div class="book">
+  <table>
+    <thead><tr><th>price</th><th>size</th><th>orders</th><th>total</th></tr></thead>
+    <tbody id="asks"></tbody>
+    <tbody><tr class="spread"><td colspan="4" id="spread">—</td></tr></tbody>
+    <tbody id="bids"></tbody>
+  </table>
+</div>
+
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  let ws = null;
+  // Price-keyed, like every reconstruction in tools/: order comes from sorting.
+  let book = { bids: new Map(), asks: new Map() };
+  let prevShown = { bids: new Map(), asks: new Map() };   // for the change flash
+  let lastTime = null, lastHeight = null, frames = 0, chan = 'l2Book', err = '';
+  let decimals = 5;
+
+  // ---- protocol ----------------------------------------------------------
+
+  function subscription() {
+    const s = { type: $('chan').value, coin: $('coin').value.trim() };
+    const lv = parseInt($('levels').value, 10);
+    // The upstream refuses an explicit 20 -- that is its default, asked for by
+    // leaving the field out.
+    if (lv && lv !== 20) s.nLevels = lv;
+    return s;
+  }
+
+  function sideFrom(levels) {
+    const m = new Map();
+    for (const l of levels) m.set(l.px, { sz: l.sz, n: l.n });
+    return m;
+  }
+
+  function applyDiff(side, d) {
+    for (const [px, sz, n] of (d.upd || [])) side.set(px, { sz, n });
+    for (const px of (d.del || [])) side.delete(px);
+  }
+
+  function onFrame(msg) {
+    if (msg.channel === 'error') { err = 'upstream error: ' + msg.data; render(); return; }
+    if (msg.channel !== chan) return;
+    frames++;
+    const data = msg.data;
+
+    if (chan === 'l2Book') {
+      book = { bids: sideFrom(data.levels[0]), asks: sideFrom(data.levels[1]) };
+      lastTime = data.time; lastHeight = null;
+    } else if (data.Snapshot) {
+      const d = data.Snapshot;
+      // A second snapshot mid-stream is the proxy moving us to another node:
+      // start over from it, never merge.
+      book = { bids: sideFrom(d.levels[0]), asks: sideFrom(d.levels[1]) };
+      lastTime = d.time; lastHeight = d.height;
+      err = frames > 1 ? 'снимок посреди потока — книга перестроена (смена узла)' : '';
+    } else if (data.Updates) {
+      const d = data.Updates;
+      if (lastHeight === null) return;            // increments before any snapshot
+      if (d.prevHeight !== lastHeight) {
+        err = `разрыв: prevHeight ${d.prevHeight}, применена ${lastHeight} — пропущено обновление`;
+      }
+      applyDiff(book.bids, d.bids);
+      applyDiff(book.asks, d.asks);
+      lastTime = d.time; lastHeight = d.height;
+    }
+    render();
+  }
+
+  // ---- rendering ---------------------------------------------------------
+
+  function rows(side, bids) {
+    const n = Math.max(1, parseInt($('rows').value, 10) || 20);
+    const sorted = [...side.entries()].sort((a, b) => bids ? b[0] - a[0] : a[0] - b[0]).slice(0, n);
+    let cum = 0;
+    return sorted.map(([px, l]) => ({ px, sz: l.sz, n: l.n, cum: (cum += parseFloat(l.sz)) }));
+  }
+
+  function fmt(x) { return x.toFixed(decimals); }
+
+  function draw(tbody, list, cls, maxCum, prev) {
+    tbody.innerHTML = '';
+    for (const r of list) {
+      const was = prev.get(r.px);
+      const changed = !was || was.sz !== r.sz || was.n !== r.n;
+      const tr = document.createElement('tr');
+      tr.className = cls + (changed ? ' flash' : '');
+      const w = maxCum ? (100 * r.cum / maxCum).toFixed(1) : 0;
+      tr.innerHTML =
+        `<td class="px"><span>${r.px}</span></td>` +
+        `<td><span>${r.sz}</span></td>` +
+        `<td><span>${r.n}</span></td>` +
+        `<td><div class="fill" style="width:${w}%;left:auto;right:0;background:var(--${cls}-bar)"></div><span>${fmt(r.cum)}</span></td>`;
+      tbody.appendChild(tr);
+    }
+  }
+
+  function render() {
+    // Decimal places follow the data rather than a guess per coin.
+    const sample = book.bids.values().next().value;
+    if (sample) decimals = (sample.sz.split('.')[1] || '').length;
+
+    const bids = rows(book.bids, true), asks = rows(book.asks, false);
+    const maxCum = Math.max(bids.at(-1)?.cum || 0, asks.at(-1)?.cum || 0);
+    // Asks run top-down toward the spread, so the best ask sits next to it.
+    draw($('asks'), [...asks].reverse(), 'ask', maxCum, prevShown.asks);
+    draw($('bids'), bids, 'bid', maxCum, prevShown.bids);
+    prevShown = { bids: new Map(bids.map(r => [r.px, r])), asks: new Map(asks.map(r => [r.px, r])) };
+
+    const bb = bids[0]?.px, ba = asks[0]?.px;
+    $('spread').textContent = bb && ba
+      ? `spread ${(ba - bb).toFixed(Math.max(0, (String(bb).split('.')[1] || '').length))}   mid ${((+ba + +bb) / 2)}`
+      : '—';
+    status();
+  }
+
+  function status() {
+    const parts = [`<span><b>${chan}</b> ${$('coin').value.trim()}</span>`];
+    if (lastTime != null) {
+      const age = Date.now() - lastTime;
+      // 2 s is the staleness threshold from the freshness plan: measured p99
+      // on a healthy node is ~640 ms, so anything past two seconds is a node
+      // that is alive and behind.
+      const cls = age > 2000 ? 'bad' : age > 1000 ? 'warn' : '';
+      parts.push(`<span>time <b>${new Date(lastTime).toISOString().slice(11, 23)}</b></span>`);
+      parts.push(`<span class="age ${cls}">age <b>${age} ms</b></span>`);
+    }
+    if (lastHeight != null) parts.push(`<span>height <b>${lastHeight}</b></span>`);
+    parts.push(`<span>frames <b>${frames}</b></span>`);
+    parts.push(`<span>levels <b>${book.bids.size}/${book.asks.size}</b></span>`);
+    if (err) parts.push(`<span class="err">${err}</span>`);
+    $('status').innerHTML = parts.join('');
+  }
+  // The age keeps climbing between frames -- that is the point: a source that
+  // is alive but behind shows up here without any frame having to arrive.
+  setInterval(() => { if (lastTime != null) status(); }, 250);
+
+  // ---- connection --------------------------------------------------------
+
+  function connect() {
+    disconnect();
+    chan = $('chan').value;
+    book = { bids: new Map(), asks: new Map() }; prevShown = { bids: new Map(), asks: new Map() };
+    lastTime = null; lastHeight = null; frames = 0; err = '';
+    render();
+    ws = new WebSocket($('url').value.trim());
+    ws.onopen = () => {
+      ws.send(JSON.stringify({ method: 'subscribe', subscription: subscription() }));
+      $('btn').textContent = 'Disconnect'; $('btn').classList.add('off');
+    };
+    ws.onmessage = e => { try { onFrame(JSON.parse(e.data)); } catch (x) { err = 'bad frame: ' + x; status(); } };
+    ws.onerror = () => { err = 'ошибка соединения'; status(); };
+    ws.onclose = () => { err = err || 'соединение закрыто'; status(); $('btn').textContent = 'Connect'; $('btn').classList.remove('off'); ws = null; };
+  }
+
+  function disconnect() { if (ws) { ws.onclose = null; ws.close(); ws = null; } }
+
+  $('btn').onclick = () => ws ? (disconnect(), $('btn').textContent = 'Connect', $('btn').classList.remove('off'), err = '', status()) : connect();
+  for (const id of ['url', 'coin', 'levels']) $(id).addEventListener('keydown', e => { if (e.key === 'Enter') connect(); });
+})();
+</script>
+</body>
+</html>
