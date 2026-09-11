@@ -8,28 +8,35 @@
   :root {
     --bg: #0e1116; --panel: #151a22; --line: #232a35; --fg: #d6dbe4; --dim: #7f8794;
     --bid: #3fb950; --ask: #f2555a; --bid-bar: rgba(63,185,80,.16); --ask-bar: rgba(242,85,90,.16);
-    --flash: rgba(255,214,102,.45); --warn: #f2c94c; --bad: #f2555a;
+    --flash: rgba(255,214,102,.45); --warn: #f2c94c; --bad: #f2555a; --sync: #5b9cf5;
   }
   * { box-sizing: border-box; }
   body { margin: 0; background: var(--bg); color: var(--fg);
          font: 13px/1.4 -apple-system, "Segoe UI", Roboto, sans-serif; }
-  .bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
-         padding: 10px 14px; background: var(--panel); border-bottom: 1px solid var(--line); }
-  .bar label { color: var(--dim); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
-  .bar input, .bar select { background: var(--bg); color: var(--fg); border: 1px solid var(--line);
+  .top { display: flex; gap: 10px; align-items: center; padding: 8px 14px;
+         background: var(--panel); border-bottom: 1px solid var(--line); }
+  .top .mode { font-family: ui-monospace, Consolas, monospace; font-size: 12px; color: var(--dim); }
+  .top .mode b { color: var(--sync); }
+  label { color: var(--dim); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
+  input, select { background: var(--bg); color: var(--fg); border: 1px solid var(--line);
          border-radius: 4px; padding: 5px 8px; font: inherit; }
-  .bar input.url { width: 260px; } .bar input.coin { width: 70px; }
-  .bar input.num { width: 60px; }
-  .bar button { background: #2b6de0; color: #fff; border: 0; border-radius: 4px;
+  input.url { width: 240px; } input.coin { width: 64px; } input.num { width: 56px; }
+  button { background: #2b6de0; color: #fff; border: 0; border-radius: 4px;
          padding: 6px 14px; font: inherit; cursor: pointer; }
-  .bar button.off { background: #3a4150; }
-  .status { display: flex; flex-wrap: wrap; gap: 18px; padding: 8px 14px;
+  button.off { background: #3a4150; } button.sync { background: var(--sync); }
+  .panels { display: grid; grid-template-columns: 1fr 1fr; gap: 0; }
+  .panel { border-right: 1px solid var(--line); min-width: 0; }
+  .panel:last-child { border-right: 0; }
+  .bar { display: flex; flex-wrap: wrap; gap: 6px; align-items: center;
+         padding: 8px 12px; background: var(--panel); border-bottom: 1px solid var(--line); }
+  .status { display: flex; flex-wrap: wrap; gap: 14px; padding: 6px 12px; min-height: 30px;
             font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; font-size: 12px;
             color: var(--dim); border-bottom: 1px solid var(--line); }
   .status b { color: var(--fg); font-weight: 500; }
   .status .age.warn b { color: var(--warn); } .status .age.bad b { color: var(--bad); font-weight: 700; }
   .status .err { color: var(--bad); font-weight: 600; }
-  .book { max-width: 620px; margin: 0; padding: 8px 14px 24px;
+  .status .held b { color: var(--sync); }
+  .book { padding: 6px 12px 20px; overflow-x: auto;
           font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; font-size: 12.5px;
           font-variant-numeric: tabular-nums; }
   .book table { width: 100%; border-collapse: collapse; }
@@ -37,7 +44,7 @@
              padding: 4px 8px; border-bottom: 1px solid var(--line); }
   .book th:first-child, .book td:first-child { text-align: left; }
   .book td { position: relative; padding: 2px 8px; text-align: right; white-space: nowrap; }
-  .book td .fill { position: absolute; inset: 0; z-index: 0; pointer-events: none; }
+  .book td .fill { position: absolute; top: 0; bottom: 0; right: 0; z-index: 0; pointer-events: none; }
   .book td span { position: relative; z-index: 1; }
   tr.ask td.px { color: var(--ask); } tr.bid td.px { color: var(--bid); }
   tr.flash td { animation: flash .5s ease-out; }
@@ -45,184 +52,269 @@
   tr.spread td { text-align: center; color: var(--dim); padding: 6px 8px;
                  border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
   @media (prefers-reduced-motion: reduce) { tr.flash td { animation: none; } }
+  @media (max-width: 1100px) { .panels { grid-template-columns: 1fr; } .panel { border-right: 0; border-bottom: 1px solid var(--line); } }
 </style>
 </head>
 <body>
 
-<div class="bar">
-  <label>url</label>       <input class="url"  id="url"   value="ws://localhost:48000/ws">
-  <label>coin</label>      <input class="coin" id="coin"  value="BTC">
-  <label>levels</label>    <input class="num"  id="levels" placeholder="20" title="пусто = 20 (явную 20 апстрим отвергает)">
-  <label>channel</label>
-  <select id="chan"><option>l2Book</option><option>l2Diff</option></select>
-  <label>rows</label>      <input class="num"  id="rows"  value="20">
-  <button id="btn">Connect</button>
+<div class="top">
+  <label>rows</label> <input class="num" id="rows" value="20">
+  <button id="sync" class="sync" title="показать у обоих кадр с ближайшим временем блока">Sync</button>
+  <button id="live" class="off">Live</button>
+  <span class="mode" id="mode">live</span>
 </div>
 
-<div class="status" id="status">
-  <span>не подключено</span>
+<div class="panels">
+  <div class="panel" id="p1"></div>
+  <div class="panel" id="p2"></div>
 </div>
 
-<div class="book">
-  <table>
-    <thead><tr><th>price</th><th>size</th><th>orders</th><th>total</th></tr></thead>
-    <tbody id="asks"></tbody>
-    <tbody><tr class="spread"><td colspan="4" id="spread">—</td></tr></tbody>
-    <tbody id="bids"></tbody>
-  </table>
-</div>
+<template id="tpl">
+  <div class="bar">
+    <input class="url" data-f="url">
+    <input class="coin" data-f="coin" value="BTC">
+    <input class="num" data-f="levels" placeholder="20" title="пусто = 20 (явную 20 апстрим отвергает)">
+    <select data-f="chan"><option>l2Book</option><option>l2Diff</option></select>
+    <button data-f="btn">Connect</button>
+  </div>
+  <div class="status" data-f="status"><span>не подключено</span></div>
+  <div class="book">
+    <table>
+      <thead><tr><th>price</th><th>size</th><th>orders</th><th>total</th></tr></thead>
+      <tbody data-f="asks"></tbody>
+      <tbody><tr class="spread"><td colspan="4" data-f="spread">—</td></tr></tbody>
+      <tbody data-f="bids"></tbody>
+    </table>
+  </div>
+</template>
 
 <script>
 (() => {
   const $ = id => document.getElementById(id);
-  let ws = null;
-  // Price-keyed, like every reconstruction in tools/: order comes from sorting.
-  let book = { bids: new Map(), asks: new Map() };
-  let prevShown = { bids: new Map(), asks: new Map() };   // for the change flash
-  let lastTime = null, lastHeight = null, frames = 0, chan = 'l2Book', err = '';
-  let decimals = 5;
+  const HISTORY = 400;          // frames kept per source for Sync; ~25 s at 15/s
+  const STALE_MS = 2000;        // the freshness threshold measured on healthy nodes
+  let live = true;
 
-  // ---- protocol ----------------------------------------------------------
+  // ---- one source ---------------------------------------------------------
 
-  function subscription() {
-    const s = { type: $('chan').value, coin: $('coin').value.trim() };
-    const lv = parseInt($('levels').value, 10);
-    // The upstream refuses an explicit 20 -- that is its default, asked for by
-    // leaving the field out.
-    if (lv && lv !== 20) s.nLevels = lv;
-    return s;
-  }
+  class Panel {
+    constructor(root, url) {
+      root.appendChild($('tpl').content.cloneNode(true));
+      this.f = {};
+      for (const el of root.querySelectorAll('[data-f]')) this.f[el.dataset.f] = el;
+      this.f.url.value = url;
+      this.ws = null; this.chan = 'l2Book';
+      this.reset();
+      this.f.btn.onclick = () => this.ws ? this.disconnect() : this.connect();
+      for (const k of ['url', 'coin', 'levels']) this.f[k].addEventListener('keydown', e => { if (e.key === 'Enter') this.connect(); });
+      this.status();
+    }
 
-  function sideFrom(levels) {
-    const m = new Map();
-    for (const l of levels) m.set(l.px, { sz: l.sz, n: l.n });
-    return m;
-  }
+    reset() {
+      this.book = { bids: new Map(), asks: new Map() };
+      this.prev = { bids: new Map(), asks: new Map() };
+      this.history = [];                       // {time, height, bids, asks}
+      this.shown = null;                       // the frame on screen when not live
+      this.lastTime = null; this.lastHeight = null; this.frames = 0; this.err = '';
+      this.decimals = 5;
+    }
 
-  function applyDiff(side, d) {
-    for (const [px, sz, n] of (d.upd || [])) side.set(px, { sz, n });
-    for (const px of (d.del || [])) side.delete(px);
-  }
+    subscription() {
+      const s = { type: this.f.chan.value, coin: this.f.coin.value.trim() };
+      const lv = parseInt(this.f.levels.value, 10);
+      // The upstream refuses an explicit 20 -- that is its default, asked for by
+      // leaving the field out.
+      if (lv && lv !== 20) s.nLevels = lv;
+      return s;
+    }
 
-  function onFrame(msg) {
-    if (msg.channel === 'error') { err = 'upstream error: ' + msg.data; render(); return; }
-    if (msg.channel !== chan) return;
-    frames++;
-    const data = msg.data;
+    static side(levels) {
+      const m = new Map();
+      for (const l of levels) m.set(l.px, { sz: l.sz, n: l.n });
+      return m;
+    }
+    static apply(side, d) {
+      for (const [px, sz, n] of (d.upd || [])) side.set(px, { sz, n });
+      for (const px of (d.del || [])) side.delete(px);
+    }
 
-    if (chan === 'l2Book') {
-      book = { bids: sideFrom(data.levels[0]), asks: sideFrom(data.levels[1]) };
-      lastTime = data.time; lastHeight = null;
-    } else if (data.Snapshot) {
-      const d = data.Snapshot;
-      // A second snapshot mid-stream is the proxy moving us to another node:
-      // start over from it, never merge.
-      book = { bids: sideFrom(d.levels[0]), asks: sideFrom(d.levels[1]) };
-      lastTime = d.time; lastHeight = d.height;
-      err = frames > 1 ? 'снимок посреди потока — книга перестроена (смена узла)' : '';
-    } else if (data.Updates) {
-      const d = data.Updates;
-      if (lastHeight === null) return;            // increments before any snapshot
-      if (d.prevHeight !== lastHeight) {
-        err = `разрыв: prevHeight ${d.prevHeight}, применена ${lastHeight} — пропущено обновление`;
+    onFrame(msg) {
+      if (msg.channel === 'error') { this.err = 'upstream error: ' + msg.data; this.status(); return; }
+      if (msg.channel !== this.chan) return;
+      this.frames++;
+      const data = msg.data;
+
+      if (this.chan === 'l2Book') {
+        this.book = { bids: Panel.side(data.levels[0]), asks: Panel.side(data.levels[1]) };
+        this.lastTime = data.time; this.lastHeight = null;
+      } else if (data.Snapshot) {
+        const d = data.Snapshot;
+        // A second snapshot mid-stream is the proxy moving us to another node:
+        // start over from it, never merge.
+        this.book = { bids: Panel.side(d.levels[0]), asks: Panel.side(d.levels[1]) };
+        this.lastTime = d.time; this.lastHeight = d.height;
+        this.err = this.frames > 1 ? 'снимок посреди потока — книга перестроена (смена узла)' : '';
+      } else if (data.Updates) {
+        const d = data.Updates;
+        if (this.lastHeight === null) return;
+        if (d.prevHeight !== this.lastHeight) {
+          this.err = `разрыв: prevHeight ${d.prevHeight}, применена ${this.lastHeight} — пропущено обновление`;
+        }
+        Panel.apply(this.book.bids, d.bids);
+        Panel.apply(this.book.asks, d.asks);
+        this.lastTime = d.time; this.lastHeight = d.height;
+      } else {
+        return;
       }
-      applyDiff(book.bids, d.bids);
-      applyDiff(book.asks, d.asks);
-      lastTime = d.time; lastHeight = d.height;
+
+      // Kept for Sync. l2Diff mutates the maps in place, so they are copied;
+      // l2Book replaces them per frame, so the copy is free to skip.
+      const snap = this.chan === 'l2Book'
+        ? { time: this.lastTime, height: null, bids: this.book.bids, asks: this.book.asks }
+        : { time: this.lastTime, height: this.lastHeight, bids: new Map(this.book.bids), asks: new Map(this.book.asks) };
+      this.history.push(snap);
+      if (this.history.length > HISTORY) this.history.shift();
+
+      if (live) this.render(snap, true);
+      else this.status();
     }
-    render();
-  }
 
-  // ---- rendering ---------------------------------------------------------
+    /** The kept frame whose block time is nearest to `t`. */
+    nearest(t) {
+      let best = null;
+      for (const h of this.history) if (!best || Math.abs(h.time - t) < Math.abs(best.time - t)) best = h;
+      return best;
+    }
 
-  function rows(side, bids) {
-    const n = Math.max(1, parseInt($('rows').value, 10) || 20);
-    const sorted = [...side.entries()].sort((a, b) => bids ? b[0] - a[0] : a[0] - b[0]).slice(0, n);
-    let cum = 0;
-    return sorted.map(([px, l]) => ({ px, sz: l.sz, n: l.n, cum: (cum += parseFloat(l.sz)) }));
-  }
+    // ---- drawing ---------------------------------------------------------
 
-  function fmt(x) { return x.toFixed(decimals); }
+    rows(side, bids) {
+      const n = Math.max(1, parseInt($('rows').value, 10) || 20);
+      const sorted = [...side.entries()].sort((a, b) => bids ? b[0] - a[0] : a[0] - b[0]).slice(0, n);
+      let cum = 0;
+      return sorted.map(([px, l]) => ({ px, sz: l.sz, n: l.n, cum: (cum += parseFloat(l.sz)) }));
+    }
 
-  function draw(tbody, list, cls, maxCum, prev) {
-    tbody.innerHTML = '';
-    for (const r of list) {
-      const was = prev.get(r.px);
-      const changed = !was || was.sz !== r.sz || was.n !== r.n;
-      const tr = document.createElement('tr');
-      tr.className = cls + (changed ? ' flash' : '');
-      const w = maxCum ? (100 * r.cum / maxCum).toFixed(1) : 0;
-      tr.innerHTML =
-        `<td class="px"><span>${r.px}</span></td>` +
-        `<td><span>${r.sz}</span></td>` +
-        `<td><span>${r.n}</span></td>` +
-        `<td><div class="fill" style="width:${w}%;left:auto;right:0;background:var(--${cls}-bar)"></div><span>${fmt(r.cum)}</span></td>`;
-      tbody.appendChild(tr);
+    draw(tbody, list, cls, maxCum, prev, flash) {
+      tbody.innerHTML = '';
+      for (const r of list) {
+        const was = prev.get(r.px);
+        const changed = flash && (!was || was.sz !== r.sz || was.n !== r.n);
+        const tr = document.createElement('tr');
+        tr.className = cls + (changed ? ' flash' : '');
+        const w = maxCum ? (100 * r.cum / maxCum).toFixed(1) : 0;
+        tr.innerHTML =
+          `<td class="px"><span>${r.px}</span></td>` +
+          `<td><span>${r.sz}</span></td>` +
+          `<td><span>${r.n}</span></td>` +
+          `<td><div class="fill" style="width:${w}%;background:var(--${cls}-bar)"></div><span>${r.cum.toFixed(this.decimals)}</span></td>`;
+        tbody.appendChild(tr);
+      }
+    }
+
+    render(frame, flash) {
+      this.shown = frame;
+      const sample = frame.bids.values().next().value;
+      if (sample) this.decimals = (sample.sz.split('.')[1] || '').length;
+
+      const bids = this.rows(frame.bids, true), asks = this.rows(frame.asks, false);
+      const maxCum = Math.max(bids.at(-1)?.cum || 0, asks.at(-1)?.cum || 0);
+      // Asks run top-down toward the spread, so the best ask sits next to it.
+      this.draw(this.f.asks, [...asks].reverse(), 'ask', maxCum, this.prev.asks, flash);
+      this.draw(this.f.bids, bids, 'bid', maxCum, this.prev.bids, flash);
+      this.prev = { bids: new Map(bids.map(r => [r.px, r])), asks: new Map(asks.map(r => [r.px, r])) };
+
+      const bb = bids[0]?.px, ba = asks[0]?.px;
+      this.f.spread.textContent = bb && ba
+        ? `spread ${(ba - bb).toFixed(Math.max(0, (String(bb).split('.')[1] || '').length))}   mid ${(+ba + +bb) / 2}`
+        : '—';
+      this.status();
+    }
+
+    status() {
+      const parts = [`<span><b>${this.chan}</b> ${this.f.coin.value.trim()}</span>`];
+      const shown = live ? null : this.shown;
+      const t = shown ? shown.time : this.lastTime;
+      if (t != null) {
+        parts.push(`<span${shown ? ' class="held"' : ''}>time <b>${new Date(t).toISOString().slice(11, 23)}</b></span>`);
+        if (!shown) {
+          // Kept climbing between frames on purpose: a source that is alive but
+          // behind shows up here without any frame having to arrive.
+          const age = Date.now() - t;
+          const cls = age > STALE_MS ? 'bad' : age > STALE_MS / 2 ? 'warn' : '';
+          parts.push(`<span class="age ${cls}">age <b>${age} ms</b></span>`);
+        }
+      }
+      const h = shown ? shown.height : this.lastHeight;
+      if (h != null) parts.push(`<span>height <b>${h}</b></span>`);
+      parts.push(`<span>frames <b>${this.frames}</b></span>`);
+      parts.push(`<span>levels <b>${this.book.bids.size}/${this.book.asks.size}</b></span>`);
+      if (this.err) parts.push(`<span class="err">${this.err}</span>`);
+      this.f.status.innerHTML = parts.join('');
+    }
+
+    // ---- connection ------------------------------------------------------
+
+    connect() {
+      this.disconnect();
+      this.chan = this.f.chan.value;
+      this.reset();
+      this.render({ time: null, height: null, bids: new Map(), asks: new Map() }, false);
+      this.ws = new WebSocket(this.f.url.value.trim());
+      this.ws.onopen = () => {
+        this.ws.send(JSON.stringify({ method: 'subscribe', subscription: this.subscription() }));
+        this.f.btn.textContent = 'Disconnect'; this.f.btn.classList.add('off');
+      };
+      this.ws.onmessage = e => { try { this.onFrame(JSON.parse(e.data)); } catch (x) { this.err = 'bad frame: ' + x; this.status(); } };
+      this.ws.onerror = () => { this.err = 'ошибка соединения'; this.status(); };
+      this.ws.onclose = () => { this.err = this.err || 'соединение закрыто'; this.ws = null; this.f.btn.textContent = 'Connect'; this.f.btn.classList.remove('off'); this.status(); };
+    }
+
+    disconnect() {
+      if (!this.ws) return;
+      this.ws.onclose = null; this.ws.close(); this.ws = null;
+      this.f.btn.textContent = 'Connect'; this.f.btn.classList.remove('off');
+      this.err = ''; this.status();
     }
   }
 
-  function render() {
-    // Decimal places follow the data rather than a guess per coin.
-    const sample = book.bids.values().next().value;
-    if (sample) decimals = (sample.sz.split('.')[1] || '').length;
+  // ---- two of them, and the sync between them -----------------------------
 
-    const bids = rows(book.bids, true), asks = rows(book.asks, false);
-    const maxCum = Math.max(bids.at(-1)?.cum || 0, asks.at(-1)?.cum || 0);
-    // Asks run top-down toward the spread, so the best ask sits next to it.
-    draw($('asks'), [...asks].reverse(), 'ask', maxCum, prevShown.asks);
-    draw($('bids'), bids, 'bid', maxCum, prevShown.bids);
-    prevShown = { bids: new Map(bids.map(r => [r.px, r])), asks: new Map(asks.map(r => [r.px, r])) };
+  const panels = [
+    new Panel($('p1'), 'ws://localhost:48000/ws'),
+    new Panel($('p2'), 'wss://api.hyperliquid.xyz/ws'),
+  ];
 
-    const bb = bids[0]?.px, ba = asks[0]?.px;
-    $('spread').textContent = bb && ba
-      ? `spread ${(ba - bb).toFixed(Math.max(0, (String(bb).split('.')[1] || '').length))}   mid ${((+ba + +bb) / 2)}`
-      : '—';
-    status();
-  }
-
-  function status() {
-    const parts = [`<span><b>${chan}</b> ${$('coin').value.trim()}</span>`];
-    if (lastTime != null) {
-      const age = Date.now() - lastTime;
-      // 2 s is the staleness threshold from the freshness plan: measured p99
-      // on a healthy node is ~640 ms, so anything past two seconds is a node
-      // that is alive and behind.
-      const cls = age > 2000 ? 'bad' : age > 1000 ? 'warn' : '';
-      parts.push(`<span>time <b>${new Date(lastTime).toISOString().slice(11, 23)}</b></span>`);
-      parts.push(`<span class="age ${cls}">age <b>${age} ms</b></span>`);
+  // Hold both at the frames whose block times are nearest each other. The
+  // slower source sets the moment: it has fewer frames to choose from, so the
+  // faster one is matched to it, not the other way round.
+  function sync() {
+    const have = panels.filter(p => p.history.length);
+    if (have.length < 2) { $('mode').textContent = 'sync: нужны данные от обоих'; return; }
+    live = false;
+    const anchor = have.reduce((a, p) => (p.lastTime < a.lastTime ? p : a));
+    const t = anchor.lastTime;
+    const deltas = [];
+    for (const p of panels) {
+      const fr = p.nearest(t);
+      if (!fr) continue;
+      p.render(fr, false);
+      deltas.push(`${fr.time - t >= 0 ? '+' : ''}${fr.time - t} ms`);
     }
-    if (lastHeight != null) parts.push(`<span>height <b>${lastHeight}</b></span>`);
-    parts.push(`<span>frames <b>${frames}</b></span>`);
-    parts.push(`<span>levels <b>${book.bids.size}/${book.asks.size}</b></span>`);
-    if (err) parts.push(`<span class="err">${err}</span>`);
-    $('status').innerHTML = parts.join('');
-  }
-  // The age keeps climbing between frames -- that is the point: a source that
-  // is alive but behind shows up here without any frame having to arrive.
-  setInterval(() => { if (lastTime != null) status(); }, 250);
-
-  // ---- connection --------------------------------------------------------
-
-  function connect() {
-    disconnect();
-    chan = $('chan').value;
-    book = { bids: new Map(), asks: new Map() }; prevShown = { bids: new Map(), asks: new Map() };
-    lastTime = null; lastHeight = null; frames = 0; err = '';
-    render();
-    ws = new WebSocket($('url').value.trim());
-    ws.onopen = () => {
-      ws.send(JSON.stringify({ method: 'subscribe', subscription: subscription() }));
-      $('btn').textContent = 'Disconnect'; $('btn').classList.add('off');
-    };
-    ws.onmessage = e => { try { onFrame(JSON.parse(e.data)); } catch (x) { err = 'bad frame: ' + x; status(); } };
-    ws.onerror = () => { err = 'ошибка соединения'; status(); };
-    ws.onclose = () => { err = err || 'соединение закрыто'; status(); $('btn').textContent = 'Connect'; $('btn').classList.remove('off'); ws = null; };
+    $('mode').innerHTML = `held at <b>${new Date(t).toISOString().slice(11, 23)}</b> UTC — offsets ${deltas.join(' / ')}`;
+    $('live').classList.remove('off'); $('sync').classList.add('off');
   }
 
-  function disconnect() { if (ws) { ws.onclose = null; ws.close(); ws = null; } }
+  function goLive() {
+    live = true;
+    for (const p of panels) { p.shown = null; if (p.history.length) p.render(p.history.at(-1), false); else p.status(); }
+    $('mode').textContent = 'live';
+    $('live').classList.add('off'); $('sync').classList.remove('off');
+  }
 
-  $('btn').onclick = () => ws ? (disconnect(), $('btn').textContent = 'Connect', $('btn').classList.remove('off'), err = '', status()) : connect();
-  for (const id of ['url', 'coin', 'levels']) $(id).addEventListener('keydown', e => { if (e.key === 'Enter') connect(); });
+  $('sync').onclick = sync;
+  $('live').onclick = goLive;
+  setInterval(() => { if (live) for (const p of panels) if (p.lastTime != null) p.status(); }, 250);
 })();
 </script>
 </body>
