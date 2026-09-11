@@ -20,11 +20,11 @@
   label { color: var(--dim); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
   input, select { background: var(--bg); color: var(--fg); border: 1px solid var(--line);
          border-radius: 4px; padding: 5px 8px; font: inherit; }
-  input.url { width: 240px; } input.coin { width: 64px; } input.num { width: 56px; }
+  input.url { width: 200px; } input.coin { width: 60px; } input.num { width: 52px; }
   button { background: #2b6de0; color: #fff; border: 0; border-radius: 4px;
          padding: 6px 14px; font: inherit; cursor: pointer; }
   button.off { background: #3a4150; } button.sync { background: var(--sync); }
-  .panels { display: grid; grid-template-columns: 1fr 1fr; gap: 0; }
+  .panels { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 0; }
   .panel { border-right: 1px solid var(--line); min-width: 0; }
   .panel:last-child { border-right: 0; }
   .bar { display: flex; flex-wrap: wrap; gap: 6px; align-items: center;
@@ -52,7 +52,8 @@
   tr.spread td { text-align: center; color: var(--dim); padding: 6px 8px;
                  border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
   @media (prefers-reduced-motion: reduce) { tr.flash td { animation: none; } }
-  @media (max-width: 1100px) { .panels { grid-template-columns: 1fr; } .panel { border-right: 0; border-bottom: 1px solid var(--line); } }
+  @media (max-width: 1500px) { .panels { grid-template-columns: 1fr 1fr; } }
+  @media (max-width: 1000px) { .panels { grid-template-columns: 1fr; } .panel { border-right: 0; border-bottom: 1px solid var(--line); } }
 </style>
 </head>
 <body>
@@ -67,6 +68,7 @@
 <div class="panels">
   <div class="panel" id="p1"></div>
   <div class="panel" id="p2"></div>
+  <div class="panel" id="p3"></div>
 </div>
 
 <template id="tpl">
@@ -98,11 +100,12 @@
   // ---- one source ---------------------------------------------------------
 
   class Panel {
-    constructor(root, url) {
+    constructor(root, url, chan) {
       root.appendChild($('tpl').content.cloneNode(true));
       this.f = {};
       for (const el of root.querySelectorAll('[data-f]')) this.f[el.dataset.f] = el;
       this.f.url.value = url;
+      this.f.chan.value = chan;
       this.ws = null; this.chan = 'l2Book';
       this.reset();
       this.f.btn.onclick = () => this.ws ? this.disconnect() : this.connect();
@@ -280,9 +283,12 @@
 
   // ---- two of them, and the sync between them -----------------------------
 
+  // wsarb's full book, the public API's, and wsarb's increments rebuilt --
+  // so l2Diff can be checked against both at one block time.
   const panels = [
-    new Panel($('p1'), 'ws://localhost:48000/ws'),
-    new Panel($('p2'), 'wss://api.hyperliquid.xyz/ws'),
+    new Panel($('p1'), 'ws://localhost:48000/ws', 'l2Book'),
+    new Panel($('p2'), 'wss://api.hyperliquid.xyz/ws', 'l2Book'),
+    new Panel($('p3'), 'ws://localhost:48000/ws', 'l2Diff'),
   ];
 
   // Hold both at the frames whose block times are nearest each other. The
