@@ -69,9 +69,21 @@ pub struct SourceStats {
     /// only: the lag verdict is relative, this is the absolute worst moment.
     peak_age_ms: AtomicU64,
     /// Set by the watchdog when this source's data has fallen behind the
-    /// freshest source's. Read on the hot paths that hand a stream to a source,
-    /// so that a source being written off cannot immediately take it back.
+    /// freshest source's *and stayed there*. Read on the hot paths that hand a
+    /// stream to a source, so that a source being written off cannot
+    /// immediately take it back.
     lagging: AtomicBool,
+    /// Consecutive watchdog ticks this source has measured behind.
+    ///
+    /// The measurement is taken where the frame is parsed, so it reports our
+    /// own reader as much as it reports the node: a reader held up by a lock or
+    /// a busy runtime leaves its frames in the socket and looks exactly like a
+    /// node that has stopped advancing. Acting on a single tick did exactly
+    /// that -- it moved 145 clients at once, which loaded the runtime enough to
+    /// stall the *other* reader, which was then marked in its turn, back and
+    /// forth. A node that is genuinely behind stays behind and falls further;
+    /// a stall clears in a tick or two. So lag has to persist to count.
+    lagging_ticks: AtomicU64,
     delay_sum_us: AtomicU64,
     delay_count: AtomicU64,
     hist: [AtomicU64; NUM_BUCKETS],
@@ -145,8 +157,27 @@ impl SourceStats {
         self.lagging.load(Relaxed)
     }
 
+    /// One more tick measured behind; returns how many in a row that is.
+    pub fn note_lagging(&self) -> u64 {
+        self.lagging_ticks.fetch_add(1, Relaxed) + 1
+    }
+
+    /// Caught up: forget both the mark and the run of ticks behind it.
+    pub fn clear_lagging(&self) {
+        self.lagging_ticks.store(0, Relaxed);
+        self.lagging.store(false, Relaxed);
+    }
+
     pub fn set_lagging(&self, v: bool) {
         self.lagging.store(v, Relaxed);
+        if !v {
+            self.lagging_ticks.store(0, Relaxed);
+        }
+    }
+
+    /// Consecutive ticks measured behind, for the dashboard.
+    pub fn lagging_ticks(&self) -> u64 {
+        self.lagging_ticks.load(Relaxed)
     }
 
     pub fn record_delay(&self, d: Duration) {
@@ -450,9 +481,13 @@ pub fn render_page(state: &crate::state::AppState) -> String {
             },
             // The worst this source has ever been, on hover. The column itself
             // is the present moment, which is what the verdict is made on.
-            peak = match s.peak_age() {
-                None => "no data yet".to_string(),
-                Some(d) => format!("worst since start: {:.1}s", d.as_secs_f64()),
+            peak = match (s.peak_age(), s.lagging_ticks()) {
+                (None, _) => "no data yet".to_string(),
+                (Some(d), 0) => format!("worst since start: {:.1}s", d.as_secs_f64()),
+                // A run of ticks behind that has not yet reached the threshold
+                // is the interesting state: it is what a marginal verdict looks
+                // like just before it fires.
+                (Some(d), n) => format!("worst since start: {:.1}s; behind for {} tick(s)", d.as_secs_f64(), n),
             },
             packets = group(s.packets.load(Relaxed)),
             disc = group(s.disconnects.load(Relaxed)),

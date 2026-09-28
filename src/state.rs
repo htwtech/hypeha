@@ -426,6 +426,16 @@ pub struct AppState {
 /// subscriber, so a deep queue costs far less than its length suggests.
 const CLIENT_QUEUE: usize = 65536;
 
+/// Consecutive watchdog ticks a source must measure behind before it is acted
+/// on. At a one-second tick that is three seconds of continuous lag on top of
+/// the depth threshold, which is what separates a node that has stopped
+/// advancing from a reader of ours that was briefly held up.
+///
+/// Acting on a single tick moved 145 clients at once, and the load of
+/// rebuilding them stalled the other reader into being marked in its turn:
+/// 1 -> 0 -> 1, every few minutes, in production.
+const LAG_CONFIRM_TICKS: u64 = 3;
+
 impl AppState {
     pub fn new(sources: Vec<Arc<Source>>, max_age: Option<Duration>) -> Self {
         Self {
@@ -790,46 +800,76 @@ impl AppState {
     /// Everything held at or below the snapshot's own height is already baked
     /// into it and would be applied twice, so it is discarded.
     pub fn deliver_snapshot(&self, key: &SubKey, client_id: u64, source: usize, height: u64, snapshot: Utf8Bytes) {
-        let mut client = None;
-        let mut backlog: Vec<Utf8Bytes> = Vec::new();
+        self.deliver_snapshot_all(key, &[client_id], source, height, &snapshot);
+    }
+
+    /// Hand one fetched snapshot to several clients parked on the same key.
+    ///
+    /// A resync parks every subscriber of a key at the same instant, and each
+    /// used to send its own fetch: 145 clients meant 145 throwaway connections
+    /// asking the same node the same question for the same 72 KB of book, all
+    /// within a second. That load is what stalled the readers and made the lag
+    /// watchdog fire again, so collapsing it is part of the fix and not a
+    /// tidy-up.
+    ///
+    /// Only the clients named in `client_ids` are served, never simply whoever
+    /// is in `pending` now. A client that parked *after* this snapshot was
+    /// taken has no held frames from before it, so giving it this snapshot
+    /// would leave a hole between the two -- exactly the silent corruption the
+    /// parking exists to prevent.
+    pub fn deliver_snapshot_all(
+        &self,
+        key: &SubKey,
+        client_ids: &[u64],
+        source: usize,
+        height: u64,
+        snapshot: &Utf8Bytes,
+    ) {
+        // (client, its own backlog): the snapshot is shared, the held frames
+        // behind it are not -- each client parked with its own queue.
+        let mut ready: Vec<(Arc<Client>, Vec<Utf8Bytes>)> = Vec::new();
 
         if let Some(mut entry) = self.subs.get_mut(key) {
-            if let Some(idx) = entry.pending.iter().position(|p| p.client.id == client_id) {
-                let Pending { client: c, held, .. } = entry.pending.remove(idx);
-                backlog.push(snapshot);
-                // On a single-sourced channel only the snapshot's own source may
-                // follow it: an increment computed against another node's book
-                // does not apply to this one. Elsewhere every source's frames
-                // are equally valid, which is the point of racing them.
-                let single = key.single_sourced();
+            // On a single-sourced channel only the snapshot's own source may
+            // follow it: an increment computed against another node's book does
+            // not apply to this one. Elsewhere every source's frames are
+            // equally valid, which is the point of racing them.
+            let single = key.single_sourced();
+            for id in client_ids {
+                let Some(idx) = entry.pending.iter().position(|p| p.client.id == *id) else {
+                    continue;
+                };
+                let Pending { client, held, .. } = entry.pending.remove(idx);
+                let mut backlog = vec![snapshot.clone()];
                 backlog.extend(
                     held.into_iter()
                         .filter(|(sid, h, _)| *h > height && (!single || *sid == source))
                         .map(|(_, _, b)| b),
                 );
-                // Pin the leader to whoever the snapshot came from. Without it
-                // the source that answered the fetch and the source that took
-                // the stream are two independent choices, and with more than two
-                // nodes they can differ -- splicing one node's increments onto
-                // another's book.
-                if single {
-                    entry.block_leader = Some(source);
-                }
-                entry.subscribers.push(c.clone());
-                client = Some(c);
+                entry.subscribers.push(client.clone());
+                ready.push((client, backlog));
+            }
+            // Pin the leader to whoever the snapshot came from. Without it the
+            // source that answered the fetch and the source that took the
+            // stream are two independent choices, and with more than two nodes
+            // they can differ -- splicing one node's increments onto another's
+            // book.
+            if single && !ready.is_empty() {
+                entry.block_leader = Some(source);
             }
         }
 
-        if let Some(c) = client {
+        if !ready.is_empty() {
             tracing::info!(
-                client = c.id,
                 sub = %key.label(),
                 height,
-                held = backlog.len() - 1,
-                "snapshot delivered, client attached to the live stream"
+                clients = ready.len(),
+                "snapshot delivered, clients attached to the live stream"
             );
+        }
+        for (client, backlog) in ready {
             for msg in backlog {
-                if !c.send_or_hang_up(msg) {
+                if !client.send_or_hang_up(msg) {
                     break;
                 }
             }
@@ -897,7 +937,7 @@ impl AppState {
             // Nothing has been measured yet: startup, or no probe and no
             // subscribers. Nobody is behind anybody.
             for src in &self.sources {
-                src.stats.set_lagging(false);
+                src.stats.clear_lagging();
             }
             return Vec::new();
         };
@@ -906,13 +946,19 @@ impl AppState {
         for src in &self.sources {
             // A source that has never spoken is not behind -- "never" is not
             // "long ago", the same distinction `idle_for` makes.
-            let lagging = src.stats.connected.load(Relaxed)
+            let measured_behind = src.stats.connected.load(Relaxed)
                 && src
                     .stats
                     .probe_block_ms()
                     .is_some_and(|t| freshest.saturating_sub(t) > limit_ms);
-            src.stats.set_lagging(lagging);
-            if lagging {
+            if !measured_behind {
+                src.stats.clear_lagging();
+                continue;
+            }
+            // Behind on this tick. Whether that means anything depends on
+            // whether it lasts: see `lagging_ticks`.
+            if src.stats.note_lagging() >= LAG_CONFIRM_TICKS {
+                src.stats.set_lagging(true);
                 behind.push(src.id);
             }
         }
@@ -1422,6 +1468,12 @@ mod tests {
 
         at_block(&state, 0, 1_000_000);
         at_block(&state, 1, 1_000_000 - 4_000);
+
+        // Behind, but not for long enough to be believed yet.
+        for tick in 1..LAG_CONFIRM_TICKS {
+            assert!(state.lagging_sources(limit).is_empty(), "acted on tick {tick}");
+            assert!(!state.sources[1].stats.is_lagging());
+        }
         assert_eq!(state.lagging_sources(limit), vec![1]);
         assert!(state.sources[1].stats.is_lagging());
         assert!(!state.sources[0].stats.is_lagging(), "the freshest is never the one behind");
@@ -1434,6 +1486,31 @@ mod tests {
     }
 
     #[test]
+    fn a_source_that_falls_behind_for_one_tick_is_not_acted_on() {
+        // The failure this exists for: the measurement is taken where frames
+        // are parsed, so a reader of ours held up for a moment reads exactly
+        // like a node that stopped advancing. Acting on that moved 145 clients,
+        // whose rebuild stalled the other reader into being marked in its turn.
+        let state = test_state(2);
+        let limit = Duration::from_secs(3);
+        at_block(&state, 0, 1_000_000);
+        at_block(&state, 1, 1_000_000 - 4_000);
+
+        assert!(state.lagging_sources(limit).is_empty(), "one tick is not evidence");
+
+        // The stall clears; the run of ticks behind it must clear with it, or
+        // scattered blips would add up to a verdict.
+        at_block(&state, 1, 1_000_000);
+        assert!(state.lagging_sources(limit).is_empty());
+        assert_eq!(state.sources[1].stats.lagging_ticks(), 0, "the run must restart, not continue");
+
+        // Behind again: the count starts over, so a single tick still does
+        // nothing however many isolated ones came before.
+        at_block(&state, 0, 1_010_000);
+        assert!(state.lagging_sources(limit).is_empty());
+    }
+
+    #[test]
     fn a_source_that_has_never_spoken_is_not_lagging() {
         let state = test_state(2);
         state.sources[1].stats.connected.store(true, Relaxed);
@@ -1442,6 +1519,71 @@ mod tests {
         // "Never" is not "long ago" -- the same distinction `idle_for` makes.
         // A source that has yet to deliver cannot be serving anyone a stale book.
         assert!(state.lagging_sources(Duration::from_secs(3)).is_empty());
+    }
+
+    #[test]
+    fn one_snapshot_serves_every_client_parked_together() {
+        let state = test_state(2);
+        let key = SubKey::L2Diff { coin: "BTC".into(), n_sig_figs: None, n_levels: None, mantissa: None };
+        let a = state.sources[0].clone();
+        let b = state.sources[1].clone();
+
+        // Three clients following `a`. The first opens the stream; the other
+        // two join it and are attached by a snapshot of their own.
+        let mut rxs = Vec::new();
+        let mut ids = Vec::new();
+        for _ in 0..3 {
+            let (client, rx) = state.register_client("t".into());
+            state.subscribe(&client, key.clone());
+            state.deliver_snapshot(&key, client.id, a.id, 0, msg("joined"));
+            ids.push(client.id);
+            rxs.push(rx);
+        }
+        state.on_update(&a, key.clone(), Seq::Sticky(11), msg("11-a"));
+        for rx in &mut rxs {
+            drain(rx);
+        }
+
+        // `a` is taken away from them: all three park at the same instant, and
+        // all three need the same book from the same moment.
+        let work = state.resync_after_source_loss(a.id);
+        assert_eq!(work.len(), 3, "every subscriber is parked");
+        state.on_update(&b, key.clone(), Seq::Sticky(12), msg("12-b"));
+
+        // One fetch, one delivery. Per client this was one throwaway connection
+        // each -- 145 of them on a real resync, which is the load that stalled
+        // the readers in the first place.
+        state.deliver_snapshot_all(&key, &ids, b.id, 11, &msg("snap-b"));
+        for rx in &mut rxs {
+            assert_eq!(drain(rx), vec!["snap-b", "12-b"], "snapshot then its own held frames");
+        }
+        assert!(state.subs.get(&key).is_some_and(|e| e.pending.is_empty()));
+    }
+
+    #[test]
+    fn a_snapshot_is_not_given_to_a_client_that_parked_after_it_was_taken() {
+        // The client parked later has no held frames from before the snapshot,
+        // so handing it that snapshot would leave a hole between the two --
+        // silently, which is the whole thing parking exists to prevent.
+        let state = test_state(2);
+        let key = SubKey::L2Diff { coin: "BTC".into(), n_sig_figs: None, n_levels: None, mantissa: None };
+        let a = state.sources[0].clone();
+
+        let (early, mut early_rx) = state.register_client("t".into());
+        state.subscribe(&early, key.clone());
+        state.deliver_snapshot(&key, early.id, a.id, 0, msg("joined"));
+        drain(&mut early_rx);
+        state.resync_after_source_loss(a.id);
+
+        // A second client joins while the fetch for the first is in flight.
+        let (late, mut late_rx) = state.register_client("t".into());
+        state.subscribe(&late, key.clone());
+
+        // The fetch names only who it was sent for.
+        state.deliver_snapshot_all(&key, &[early.id], a.id, 11, &msg("snap"));
+        assert_eq!(drain(&mut early_rx), vec!["snap"]);
+        assert!(drain(&mut late_rx).is_empty(), "the late one waits for its own");
+        assert!(state.subs.get(&key).is_some_and(|e| e.pending.len() == 1));
     }
 
     #[test]

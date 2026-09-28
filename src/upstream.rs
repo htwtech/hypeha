@@ -233,10 +233,22 @@ pub fn rank_snapshot_sources(state: &AppState) -> Vec<(usize, String)> {
 /// server dedupes per connection and only snapshots on first insert), so this
 /// opens a throwaway connection of its own.
 pub async fn fetch_snapshot(state: Arc<AppState>, key: SubKey, client_id: u64) {
+    fetch_snapshot_for(state, key, vec![client_id]).await;
+}
+
+/// One snapshot for every client a resync parked on the same key at the same
+/// moment.
+///
+/// They were all parked together and all need the same book, so they can share
+/// one fetch. Per client it was one throwaway connection each: a resync of 145
+/// clients opened 145 of them within a second, asking the same node for the
+/// same 72 KB, and that load is what stalled the readers into looking like
+/// lagging nodes. One fetch, one delivery, whatever the crowd.
+pub async fn fetch_snapshot_for(state: Arc<AppState>, key: SubKey, client_ids: Vec<u64>) {
     for (id, url) in rank_snapshot_sources(&state) {
         match tokio::time::timeout(SNAPSHOT_TIMEOUT, snapshot_from(&url, &key)).await {
             Ok(Some((height, payload))) => {
-                state.deliver_snapshot(&key, client_id, id, height, payload);
+                state.deliver_snapshot_all(&key, &client_ids, id, height, &payload);
                 return;
             }
             Ok(None) => tracing::warn!(url = %url, sub = %key.label(), "snapshot fetch failed"),
@@ -244,7 +256,9 @@ pub async fn fetch_snapshot(state: Arc<AppState>, key: SubKey, client_id: u64) {
         }
     }
 
-    state.fail_pending(&key, client_id);
+    for client_id in client_ids {
+        state.fail_pending(&key, client_id);
+    }
 }
 
 /// Open a throwaway connection, subscribe, and return the first snapshot frame

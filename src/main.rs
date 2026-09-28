@@ -2,6 +2,7 @@
 
 use wsarb::{client, state, stats, upstream};
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -65,17 +66,34 @@ struct Args {
 const SILENT_RECONNECT_FIRST: u64 = 6;
 const SILENT_RECONNECT_EVERY: u64 = 60;
 
+/// How long the lag watchdog stands down after moving clients.
+///
+/// Long enough for the rebuild it just ordered to finish and for the readers to
+/// settle, so the next verdict is made on a quiet system rather than on the
+/// wreckage of the last one.
+const LAG_COOLDOWN: Duration = Duration::from_secs(30);
+
 /// Strip a source of the streams it is leading and rebuild its clients from a
 /// snapshot taken elsewhere. Shared by the two watchdogs: a source can fail by
 /// going quiet or by falling behind, and the cure is the same either way.
-fn take_clients_off(state: &Arc<AppState>, id: usize, why: &'static str) {
+fn take_clients_off(state: &Arc<AppState>, id: usize, why: &'static str) -> usize {
     let work = state.resync_after_source_loss(id);
-    if !work.is_empty() {
-        tracing::warn!(source = id, clients = work.len(), "{}", why);
+    if work.is_empty() {
+        return 0;
     }
+    // Grouped by subscription before fetching: everyone parked here wants the
+    // same book from the same moment, and one fetch serves them all. Ungrouped
+    // this opened a connection per client -- 145 at once on a real resync.
+    let mut by_key: HashMap<state::SubKey, Vec<u64>> = HashMap::new();
     for (key, client_id) in work {
-        tokio::spawn(upstream::fetch_snapshot(state.clone(), key, client_id));
+        by_key.entry(key).or_default().push(client_id);
     }
+    let clients: usize = by_key.values().map(Vec::len).sum();
+    tracing::warn!(source = id, clients, subs = by_key.len(), "{}", why);
+    for (key, client_ids) in by_key {
+        tokio::spawn(upstream::fetch_snapshot_for(state.clone(), key, client_ids));
+    }
+    clients
 }
 
 #[tokio::main]
@@ -173,17 +191,35 @@ async fn main() -> anyhow::Result<()> {
         let state = state.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_secs(1));
+            let mut last_move: Option<tokio::time::Instant> = None;
             loop {
                 ticker.tick().await;
-                for id in state.lagging_sources(limit) {
+                // Measured every tick regardless: the run of ticks behind a
+                // source is what the verdict is made of, and skipping a tick
+                // would lose it.
+                let behind = state.lagging_sources(limit);
+
+                // Moving a crowd of clients is itself load, and load is what
+                // makes a healthy reader look behind. So after a move, stop
+                // looking for a while: without this the first (marginal) verdict
+                // manufactured the evidence for the next one, and the two
+                // sources took turns being wrong about each other.
+                if last_move.is_some_and(|t| t.elapsed() < LAG_COOLDOWN) {
+                    continue;
+                }
+                let mut moved = 0;
+                for id in behind {
                     // Only the first pass finds clients to move: `lagging` stays
                     // set until the source catches up, but by then its entries
                     // are led by somebody else and there is nothing to take.
-                    take_clients_off(
+                    moved += take_clients_off(
                         &state,
                         id,
                         "data behind the freshest source; rebuilding its clients elsewhere",
                     );
+                }
+                if moved > 0 {
+                    last_move = Some(tokio::time::Instant::now());
                 }
             }
         });
