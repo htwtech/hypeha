@@ -3,7 +3,7 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::extract::ws::Utf8Bytes;
@@ -428,11 +428,6 @@ pub struct AppState {
     /// one and the same subscription, each opening its own connection to a node
     /// for the same book.
     fetching: DashMap<SubKey, Instant>,
-    /// The pinned probe's key, once one has been pinned. Frames on this key are
-    /// what the sources are compared by — see `lagging_sources`. Without a probe
-    /// (`--no-probe`) every frame counts instead, which compares the sources on
-    /// whatever the clients happen to be subscribed to: workable, but noisier.
-    probe: OnceLock<SubKey>,
 }
 
 /// How many pending messages we buffer per client.
@@ -463,7 +458,6 @@ impl AppState {
             clients: DashMap::new(),
             next_client_id: AtomicU64::new(1),
             fetching: DashMap::new(),
-            probe: OnceLock::new(),
         }
     }
 
@@ -492,11 +486,6 @@ impl AppState {
         self.subs.get(key).is_some_and(|e| !e.pending.is_empty())
     }
 
-    /// Whether this key is the one the sources are judged by. True for every
-    /// key when no probe is pinned.
-    pub fn is_probe_key(&self, key: &SubKey) -> bool {
-        self.probe.get().map_or(true, |p| p == key)
-    }
 
     /// Register a new client and return its handle together with the receiver
     /// its writer task should drain.
@@ -566,10 +555,6 @@ impl AppState {
     /// steadily rather than in bursts, and so makes a better latency probe than
     /// the heavier channels while costing almost nothing.
     pub fn pin(&self, key: SubKey) {
-        // Also the yardstick for lag: one channel, one coin, present on every
-        // source whatever the clients are doing. The first pin wins, so a later
-        // one cannot move the measurement out from under the watchdog.
-        let _ = self.probe.set(key.clone());
         let mut entry = self.subs.entry(key.clone()).or_default();
         entry.pinned = true;
         let need_upstream = !entry.upstream_subscribed;
@@ -972,8 +957,8 @@ impl AppState {
             .any(|s| s.id != id && s.stats.connected.load(Relaxed) && !s.stats.is_lagging())
     }
 
-    /// Sources whose data has fallen behind the freshest source's, and which
-    /// are therefore serving their clients a book the chain has moved past.
+    /// Sources whose book has fallen behind the others', and which are
+    /// therefore serving their clients a state the chain has moved past.
     ///
     /// The other half of `silent_sources`: a node can fail by going quiet, or by
     /// carrying on at the wrong height. The second is the one that hurts, and it
@@ -981,8 +966,15 @@ impl AppState {
     /// after a restart is the *chattiest* source there is, so `idle_for` reads
     /// zero while its book is minutes old.
     ///
-    /// Judged relatively, for the same reason silence is: a quiet market ages
-    /// every source at once and that is not a fault, while a node that is
+    /// Measured in blocks, off each source's own `GET /health` (see
+    /// [`crate::health`]), because every attempt to infer it from the stream
+    /// measured something else: how recently a source spoke, when our reader
+    /// got round to parsing, or whether the top of book had changed. A height
+    /// the server reports about itself has none of those ambiguities, and
+    /// comparing heights needs no clock.
+    ///
+    /// Judged relatively, for the same reason silence is: in a quiet market
+    /// nothing advances anywhere and that is not a fault, while a node that is
     /// genuinely behind falls behind *the others*. That also guarantees the
     /// freshest source is never in the returned list, so there is always
     /// somewhere to move the clients to.
@@ -990,31 +982,29 @@ impl AppState {
     /// Sets each source's `lagging` flag as it goes: the hot paths that hand a
     /// stream to a source read it, and recomputing this per frame would mean
     /// scanning every source on every message.
-    pub fn lagging_sources(&self, limit: Duration) -> Vec<usize> {
-        let freshest = self
-            .sources
-            .iter()
-            .filter(|s| s.stats.connected.load(Relaxed))
-            .filter_map(|s| s.stats.probe_block_ms())
-            .max();
+    pub fn lagging_sources(&self, limit_blocks: u64) -> Vec<usize> {
+        let freshest = self.sources.iter().filter_map(|s| s.stats.health_height()).max();
         let Some(freshest) = freshest else {
-            // Nothing has been measured yet: startup, or no probe and no
-            // subscribers. Nobody is behind anybody.
+            // Nobody has answered a health poll yet: startup, or an upstream
+            // without the endpoint. Nobody is behind anybody.
             for src in &self.sources {
                 src.stats.clear_lagging();
             }
             return Vec::new();
         };
-        let limit_ms = limit.as_millis() as u64;
         let mut behind = Vec::new();
         for src in &self.sources {
-            // A source that has never spoken is not behind -- "never" is not
-            // "long ago", the same distinction `idle_for` makes.
-            let measured_behind = src.stats.connected.load(Relaxed)
-                && src
-                    .stats
-                    .probe_block_ms()
-                    .is_some_and(|t| freshest.saturating_sub(t) > limit_ms);
+            // A source that has never answered is not behind -- "never" is not
+            // "long ago", the same distinction `idle_for` makes -- and neither
+            // is one we simply could not reach: that is silence, and it has its
+            // own watchdog.
+            let measured_behind = src.stats.health_height().is_some_and(|h| {
+                freshest.saturating_sub(h) > limit_blocks
+                    // The server's own verdict. `initializing` and `stale` are
+                    // it telling us not to send clients here, whatever its
+                    // height says.
+                    || !src.stats.health_ready()
+            });
             if !measured_behind {
                 src.stats.clear_lagging();
                 continue;
@@ -1516,89 +1506,151 @@ mod tests {
         assert_eq!(state.silent_sources(limit), vec![1]);
     }
 
-    /// Put a source's data at a block time, the way `record_block_time` does on
-    /// the arrival path.
-    fn at_block(state: &AppState, i: usize, block_ms: u64) {
+    /// A health poll came back with this height, the source reporting itself
+    /// ready.
+    fn at_height(state: &AppState, i: usize, height: u64) {
         let s = &state.sources[i].stats;
         s.connected.store(true, Relaxed);
-        s.record_block_time(block_ms, block_ms + 200);
+        s.record_health(height, true);
     }
+
+    /// Blocks behind before a source counts as lagging, in these tests.
+    const LIMIT: u64 = 50;
 
     #[test]
     fn a_quiet_market_is_not_mistaken_for_a_lagging_source() {
         let state = test_state(2);
-        let limit = Duration::from_secs(3);
 
-        // Nothing measured yet: startup. Nobody is behind anybody.
-        assert!(state.lagging_sources(limit).is_empty());
+        // Nothing polled yet: startup. Nobody is behind anybody.
+        assert!(state.lagging_sources(LIMIT).is_empty());
 
-        // Both sit at the same block. However long ago that was -- a market
-        // that stopped trading ages every source together -- neither is at
-        // fault, and rebuilding every client here would be pure damage.
-        at_block(&state, 0, 1_000_000);
-        at_block(&state, 1, 1_000_000);
-        assert!(state.lagging_sources(limit).is_empty());
+        // Both stand at the same height. However long they have been there --
+        // in a quiet market nothing advances anywhere -- neither is at fault,
+        // and rebuilding every client here would be pure damage.
+        at_height(&state, 0, 1_000_000);
+        at_height(&state, 1, 1_000_000);
+        assert!(state.lagging_sources(LIMIT).is_empty());
         assert!(!state.sources[1].stats.is_lagging());
     }
 
     #[test]
     fn the_source_behind_the_freshest_is_the_lagging_one() {
         let state = test_state(2);
-        let limit = Duration::from_secs(3);
 
-        at_block(&state, 0, 1_000_000);
-        at_block(&state, 1, 1_000_000 - 4_000);
+        at_height(&state, 0, 1_000_000);
+        at_height(&state, 1, 1_000_000 - (LIMIT + 1));
 
         // Behind, but not for long enough to be believed yet.
         for tick in 1..LAG_CONFIRM_TICKS {
-            assert!(state.lagging_sources(limit).is_empty(), "acted on tick {tick}");
+            assert!(state.lagging_sources(LIMIT).is_empty(), "acted on tick {tick}");
             assert!(!state.sources[1].stats.is_lagging());
         }
-        assert_eq!(state.lagging_sources(limit), vec![1]);
+        assert_eq!(state.lagging_sources(LIMIT), vec![1]);
         assert!(state.sources[1].stats.is_lagging());
         assert!(!state.sources[0].stats.is_lagging(), "the freshest is never the one behind");
 
         // It catches up: the mark comes off by itself, so nothing has to
         // remember to clear it.
-        at_block(&state, 1, 1_000_000);
-        assert!(state.lagging_sources(limit).is_empty());
+        at_height(&state, 1, 1_000_000);
+        assert!(state.lagging_sources(LIMIT).is_empty());
         assert!(!state.sources[1].stats.is_lagging());
     }
 
     #[test]
-    fn a_source_that_falls_behind_for_one_tick_is_not_acted_on() {
-        // The failure this exists for: the measurement is taken where frames
-        // are parsed, so a reader of ours held up for a moment reads exactly
-        // like a node that stopped advancing. Acting on that moved 145 clients,
-        // whose rebuild stalled the other reader into being marked in its turn.
+    fn exactly_at_the_limit_is_not_behind() {
+        // Healthy sources sit a block or two apart, so the boundary is walked
+        // over constantly and must not be a verdict by itself.
         let state = test_state(2);
-        let limit = Duration::from_secs(3);
-        at_block(&state, 0, 1_000_000);
-        at_block(&state, 1, 1_000_000 - 4_000);
+        at_height(&state, 0, 1_000_000);
+        at_height(&state, 1, 1_000_000 - LIMIT);
+        for _ in 0..LAG_CONFIRM_TICKS + 1 {
+            assert!(state.lagging_sources(LIMIT).is_empty());
+        }
+    }
 
-        assert!(state.lagging_sources(limit).is_empty(), "one tick is not evidence");
+    #[test]
+    fn a_source_that_falls_behind_for_one_tick_is_not_acted_on() {
+        // Acting on a single tick moved 145 clients at once, and the load of
+        // rebuilding them made the other source look behind in its turn.
+        let state = test_state(2);
+        at_height(&state, 0, 1_000_000);
+        at_height(&state, 1, 1_000_000 - (LIMIT + 1));
 
-        // The stall clears; the run of ticks behind it must clear with it, or
+        assert!(state.lagging_sources(LIMIT).is_empty(), "one tick is not evidence");
+
+        // It recovers; the run of ticks behind it must clear with it, or
         // scattered blips would add up to a verdict.
-        at_block(&state, 1, 1_000_000);
-        assert!(state.lagging_sources(limit).is_empty());
+        at_height(&state, 1, 1_000_000);
+        assert!(state.lagging_sources(LIMIT).is_empty());
         assert_eq!(state.sources[1].stats.lagging_ticks(), 0, "the run must restart, not continue");
 
         // Behind again: the count starts over, so a single tick still does
         // nothing however many isolated ones came before.
-        at_block(&state, 0, 1_010_000);
-        assert!(state.lagging_sources(limit).is_empty());
+        at_height(&state, 0, 1_000_100);
+        assert!(state.lagging_sources(LIMIT).is_empty());
     }
 
     #[test]
-    fn a_source_that_has_never_spoken_is_not_lagging() {
+    fn a_source_that_has_never_answered_is_not_lagging() {
         let state = test_state(2);
         state.sources[1].stats.connected.store(true, Relaxed);
-        at_block(&state, 0, 1_000_000);
+        at_height(&state, 0, 1_000_000);
 
         // "Never" is not "long ago" -- the same distinction `idle_for` makes.
-        // A source that has yet to deliver cannot be serving anyone a stale book.
-        assert!(state.lagging_sources(Duration::from_secs(3)).is_empty());
+        // A source we have no reading for is not one we know to be behind.
+        assert!(state.lagging_sources(LIMIT).is_empty());
+    }
+
+    #[test]
+    fn a_source_that_cannot_be_polled_keeps_its_last_reading() {
+        // An unreachable source is `silent_sources`' business. Treating a failed
+        // poll as height zero would read as infinitely far behind and move every
+        // client off it -- on nothing more than a dropped request.
+        let state = test_state(2);
+        at_height(&state, 0, 1_000_000);
+        at_height(&state, 1, 1_000_000);
+
+        for _ in 0..10 {
+            state.sources[1].stats.record_health_failure();
+            assert!(state.lagging_sources(LIMIT).is_empty(), "a failed poll is not a verdict");
+        }
+        assert_eq!(state.sources[1].stats.health_failures(), 10);
+        assert_eq!(state.sources[1].stats.health_height(), Some(1_000_000));
+    }
+
+    #[test]
+    fn a_source_that_says_it_is_not_ready_is_behind_whatever_its_height() {
+        // `initializing` and `stale` are the server telling us not to send
+        // clients here. At startup its height can even be the higher of the two.
+        let state = test_state(2);
+        at_height(&state, 0, 1_000_000);
+        state.sources[1].stats.connected.store(true, Relaxed);
+        state.sources[1].stats.record_health(1_000_001, false);
+
+        for _ in 1..LAG_CONFIRM_TICKS {
+            assert!(state.lagging_sources(LIMIT).is_empty());
+        }
+        assert_eq!(state.lagging_sources(LIMIT), vec![1]);
+    }
+
+    #[test]
+    fn going_quiet_on_one_channel_is_not_falling_behind() {
+        // Caught in production: the yardstick was the `bbo` probe, which the
+        // upstream sends only when the top of book changes. BTC stopped moving,
+        // the probe went silent, and a source that was in fact a single block
+        // apart -- and sending more packets than the other -- was marked behind
+        // and had 140 clients taken off it. The verdict is made on the height
+        // the source reports, so a silent channel cannot move it.
+        let state = test_state(2);
+        at_height(&state, 0, 1_000_000);
+        at_height(&state, 1, 1_000_000 - 1);
+
+        // No frames at all arrive from source 1 for a long while: `data age`
+        // climbs, and that is diagnostic only.
+        for _ in 0..LAG_CONFIRM_TICKS * 3 {
+            assert!(state.lagging_sources(LIMIT).is_empty(), "silence on a channel is not lag");
+        }
+        assert!(!state.sources[1].stats.is_lagging());
     }
 
     #[test]

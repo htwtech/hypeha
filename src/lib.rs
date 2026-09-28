@@ -5,6 +5,7 @@
 //! test would end up checking its own reading of the wire rather than wsarb's.
 
 pub mod client;
+pub mod health;
 pub mod state;
 pub mod stats;
 pub mod upstream;

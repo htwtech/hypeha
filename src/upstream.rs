@@ -205,7 +205,7 @@ pub fn rank_snapshot_sources(state: &AppState) -> Vec<(usize, String)> {
         .map(|s| {
             (
                 s.stats.is_lagging(),
-                std::cmp::Reverse(s.stats.probe_block_ms().unwrap_or(0)),
+                std::cmp::Reverse(s.stats.health_height().unwrap_or(0)),
                 s.id,
                 s.url.clone(),
             )
@@ -213,9 +213,9 @@ pub fn rank_snapshot_sources(state: &AppState) -> Vec<(usize, String)> {
         .collect();
     ranked.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
 
-    // Nothing measured at all (startup, or `--no-probe` before any traffic):
+    // Nothing polled yet (startup, or an upstream without the endpoint):
     // fall back to the older question, which source spoke most recently.
-    if ranked.iter().all(|(_, block, _, _)| block.0 == 0) {
+    if ranked.iter().all(|(_, height, _, _)| height.0 == 0) {
         ranked.sort_by_key(|(_, _, id, _)| {
             state
                 .sources
@@ -460,15 +460,19 @@ fn handle_text(state: &AppState, src: &Source, text: &str) {
                 return;
             }
 
-            // Where this source stands, for `lagging_sources` to compare. Taken
-            // here, on arrival, and deliberately above the age gate: a node
-            // frozen an hour ago has every frame refused below, and dropping it
-            // from the measurement too would leave the one source that is
-            // provably behind looking like it has no opinion. Above the gate it
-            // is measured, marked, and its clients are moved off it.
-            if state.is_probe_key(&key) {
-                src.stats.record_block_time(t, now);
-            }
+            // How old the data this source is sending is, for the dashboard.
+            // Taken above the age gate on purpose: a node frozen an hour ago has
+            // every frame refused below, and dropping it from the measurement
+            // too would leave the one source that is provably stale looking like
+            // it has no opinion.
+            //
+            // Diagnostic only. It used to be what `lagging_sources` judged by,
+            // and that was wrong twice over: the moment recorded is when *our*
+            // reader parsed the frame, and restricting it to the `bbo` probe
+            // made "the price did not move" indistinguishable from "the source
+            // is behind". The verdict now comes from the source's own
+            // `GET /health` -- see `crate::health`.
+            src.stats.record_block_time(t, now);
 
             if let Some(max) = state.max_age {
                 if now > t && now - t > max.as_millis() as u64 {
@@ -751,9 +755,9 @@ mod tests {
         let state = state_with(3);
         // Source 1 holds the newest block; source 2 is a minute behind but is
         // the chattiest of the three, which is what a replaying node looks like.
-        state.sources[0].stats.record_block_time(1_000_000, 1_000_200);
-        state.sources[1].stats.record_block_time(1_002_000, 1_002_200);
-        state.sources[2].stats.record_block_time(940_000, 1_002_200);
+        state.sources[0].stats.record_health(1_000_000, true);
+        state.sources[1].stats.record_health(1_002_000, true);
+        state.sources[2].stats.record_health(940_000, true);
         assert_eq!(ids(rank_snapshot_sources(&state)), vec![1, 0, 2]);
     }
 
@@ -763,9 +767,9 @@ mod tests {
         // The one with the newest data is also the one the watchdog has just
         // marked behind -- it is replaying, so its block times run ahead of what
         // it is actually serving. The mark wins over the number.
-        state.sources[0].stats.record_block_time(1_002_000, 1_002_200);
+        state.sources[0].stats.record_health(1_002_000, true);
         state.sources[0].stats.set_lagging(true);
-        state.sources[1].stats.record_block_time(1_000_000, 1_000_200);
+        state.sources[1].stats.record_health(1_000_000, true);
         assert_eq!(ids(rank_snapshot_sources(&state)), vec![1, 0]);
 
         // Everything marked: the list must not come back empty, or the client
@@ -786,9 +790,9 @@ mod tests {
     #[test]
     fn a_disconnected_source_is_not_asked() {
         let state = state_with(2);
-        state.sources[0].stats.record_block_time(1_002_000, 1_002_200);
+        state.sources[0].stats.record_health(1_002_000, true);
         state.sources[0].stats.connected.store(false, Relaxed);
-        state.sources[1].stats.record_block_time(1_000_000, 1_000_200);
+        state.sources[1].stats.record_health(1_000_000, true);
         assert_eq!(ids(rank_snapshot_sources(&state)), vec![1]);
     }
 }

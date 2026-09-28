@@ -56,7 +56,7 @@ frame from a source socket
   → "error" → logged, dropped
   → route() → (SubKey, Seq)      subscription key + ordering value
   → future check                 a stamp ahead of the clock is refused
-  → record where this source is  probe frames only, feeds --lag-limit
+  → record how old this frame is  diagnostic only (`data age`)
   → absolute freshness check     --max-age, counted as "too old"
   → arbitration                  the three modes below
   → fan out, and pile up behind any parked client
@@ -224,7 +224,9 @@ see [Refusing data from the past](#refusing-data-from-the-past).
 
 **`data age`** is how old the data a source is sending is, against the clock —
 not to be confused with `last data`, which is how long ago it last sent
-anything. A node replaying blocks scores perfectly on the second and terribly on
+anything. Diagnostic only: it is measured where frames are parsed, so it reports
+our own reader as much as the source, and the lag verdict is made on the
+`height` column beside it instead. A node replaying blocks scores perfectly on the second and terribly on
 the first; see [A source that talks while falling
 behind](#a-source-that-talks-while-falling-behind).
 
@@ -266,7 +268,7 @@ cargo run --release -- \
 - `--probe-coin <COIN>` — coin for the permanent `bbo` probe (default `BTC`).
 - `--no-probe` — drop the probe entirely.
 - `--max-age <SECS>` — refuse frames whose block time is older than this (default 60; 0 disables).
-- `--lag-limit <SECS>` — move clients off a source whose data has fallen this far behind the freshest source's (default 3; 0 disables).
+- `--lag-blocks <N>` — move clients off a source whose book has fallen this many blocks behind the furthest-ahead source (default 50, about 3.5s; 0 disables). Read from each source's own `GET /health`.
 
 ### Refusing data from the past
 
@@ -338,13 +340,25 @@ delivers nothing it can use — its frames are older than what the client alread
 holds — while the healthy source's frames are refused for not being the leader's.
 The stream simply stops, with a working node sitting right there.
 
-`--lag-limit` closes it. Each source's position is taken from the probe — one
-channel and one coin, so the comparison is between like and like — and a source
-whose data has fallen further behind the freshest source's than the limit is
-marked `LAGGING`, has its streams taken away, and has its clients rebuilt from a
+`--lag-blocks` closes it. Each source is **asked** where it stands — wsarb polls
+its `GET /health` twice a second, which `order_book_server` answers lock-free
+with the height of the book it has built — and a source more than that many
+blocks behind the furthest-ahead one, or reporting itself not `ready`, is marked
+`LAGGING`, has its streams taken away, and has its clients rebuilt from a
 snapshot fetched **elsewhere**. It cannot take the stream back while marked, and
 it is not asked for the snapshot: the whole point is to stop handing the stream
 straight back to the node that just lost it.
+
+Asking rather than inferring matters more than it sounds. Three earlier
+versions of this read a side effect instead: how recently a source spoke (a node
+replaying old blocks is the chattiest there is), the block time of frames as
+*our* reader parsed them (a reader held up by a lock reads exactly like a node
+that stopped), and the block time of the `bbo` probe (`bbo` is sent only when
+the top of book changes, so silence there means the price did not move). The
+third one marked a source that was a single block behind and sending more
+packets than the other. A height the server reports about itself has none of
+those ambiguities — and comparing two heights needs no clock, which retires the
+question of whether ours agrees with the nodes'.
 
 The rule is relative, like silence, and for the same reason — a market that
 stops trading ages every source at once and none of them is at fault. Which also

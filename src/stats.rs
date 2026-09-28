@@ -57,14 +57,25 @@ pub struct SourceStats {
     /// the key's high-water mark ahead of the clock and silence every real frame
     /// behind it until wall time caught up.
     pub from_future: AtomicU64,
-    /// Block time of the newest probe frame seen from this source, in unix ms.
-    /// Zero means it has not spoken yet — which is not the same as being behind.
+    /// Block time of the newest frame seen from this source, in unix ms. Zero
+    /// means it has not spoken yet — which is not the same as being behind.
     ///
-    /// The yardstick for lag. Taken from one channel and one coin (the pinned
-    /// `bbo` probe) so the sources are compared on the same thing, and recorded
-    /// on arrival rather than on winning: a source that is behind loses every
-    /// race, and its frames are exactly the ones that reveal it.
-    probe_block_ms: AtomicU64,
+    /// Diagnostic only, and deliberately no longer the yardstick for lag: it
+    /// measures when *our reader* parsed a frame, so a reader held up by a lock
+    /// reads exactly like a node that stopped advancing. The dashboard shows it
+    /// as `data age` — how old the data a source is sending is — next to the
+    /// height polled from the source itself, which is what the verdict is made
+    /// on.
+    newest_block_ms: AtomicU64,
+    /// Book height this source last reported on `GET /health`, and whether that
+    /// poll found it ready. Zero height means "never answered": no measurement,
+    /// which is not the same as being at block zero.
+    health_height: AtomicU64,
+    health_ready: AtomicBool,
+    /// Polls in a row that failed. A source that cannot be reached is not
+    /// declared behind — silence is `silent_sources`' business — but the count
+    /// belongs on the dashboard.
+    health_failures: AtomicU64,
     /// Largest `now - block_time` ever seen from this source, in ms. Diagnostic
     /// only: the lag verdict is relative, this is the absolute worst moment.
     peak_age_ms: AtomicU64,
@@ -122,10 +133,10 @@ impl SourceStats {
         Some(WINDOW * self.silent_windows.load(Relaxed) as u32)
     }
 
-    /// Block time of the newest probe frame from this source, or `None` if it
-    /// has not delivered one yet.
-    pub fn probe_block_ms(&self) -> Option<u64> {
-        match self.probe_block_ms.load(Relaxed) {
+    /// Block time of the newest frame from this source, or `None` if it has not
+    /// delivered one yet.
+    pub fn newest_block_ms(&self) -> Option<u64> {
+        match self.newest_block_ms.load(Relaxed) {
             0 => None,
             ms => Some(ms),
         }
@@ -134,16 +145,49 @@ impl SourceStats {
     /// Record one arriving frame's block time. `now` is passed in because the
     /// caller has already read the clock for its own checks.
     pub fn record_block_time(&self, block_ms: u64, now_ms: u64) {
-        self.probe_block_ms.fetch_max(block_ms, Relaxed);
+        self.newest_block_ms.fetch_max(block_ms, Relaxed);
         if now_ms > block_ms {
             self.peak_age_ms.fetch_max(now_ms - block_ms, Relaxed);
         }
     }
 
+    /// Height this source reported on its last successful health poll, or
+    /// `None` if it has never answered one.
+    pub fn health_height(&self) -> Option<u64> {
+        match self.health_height.load(Relaxed) {
+            0 => None,
+            h => Some(h),
+        }
+    }
+
+    pub fn health_ready(&self) -> bool {
+        self.health_ready.load(Relaxed)
+    }
+
+    pub fn health_failures(&self) -> u64 {
+        self.health_failures.load(Relaxed)
+    }
+
+    /// A poll came back. The height only moves forward: the endpoint updates it
+    /// every thousand applied batches, so two polls can land on the same value,
+    /// and a server restarting must not read as having gone backwards.
+    pub fn record_health(&self, height: u64, ready: bool) {
+        self.health_height.fetch_max(height, Relaxed);
+        self.health_ready.store(ready, Relaxed);
+        self.health_failures.store(0, Relaxed);
+    }
+
+    /// A poll failed. The last known height is kept: it is still the best
+    /// answer to "where was this source", and a source that cannot be reached
+    /// is judged by `silent_sources`, not here.
+    pub fn record_health_failure(&self) {
+        self.health_failures.fetch_add(1, Relaxed);
+    }
+
     /// How old this source's newest data is, against the wall clock. Useful to
     /// look at, but never to judge by: a quiet market ages every source at once.
     pub fn age(&self, now_ms: u64) -> Option<Duration> {
-        self.probe_block_ms().map(|t| Duration::from_millis(now_ms.saturating_sub(t)))
+        self.newest_block_ms().map(|t| Duration::from_millis(now_ms.saturating_sub(t)))
     }
 
     pub fn peak_age(&self) -> Option<Duration> {
@@ -448,7 +492,7 @@ pub fn render_page(state: &crate::state::AppState) -> String {
         let lagging = connected && s.is_lagging();
         cum_rows.push_str(&format!(
             "<tr><td class=nd>{node}</td><td>{url}</td>\
-             <td class={cls}>{state_txt}</td><td>{last_data}</td><td title=\"{peak}\">{age}</td><td>{packets}</td><td>{disc}</td>\
+             <td class={cls}>{state_txt}</td><td>{last_data}</td><td title=\"{peak}\">{age}</td><td class={hcls}>{height}</td><td>{packets}</td><td>{disc}</td>\
              <td class=num>{wins}</td><td class=num>{dups}</td><td class=num>{stale}</td><td class={oldcls}>{old}</td><td>{avg:.1}</td><td class=hist>{hist}</td></tr>",
             node = format!("node{}", src.id + 1),
             url = html_escape(&src.url),
@@ -489,6 +533,15 @@ pub fn render_page(state: &crate::state::AppState) -> String {
                 // like just before it fires.
                 (Some(d), n) => format!("worst since start: {:.1}s; behind for {} tick(s)", d.as_secs_f64(), n),
             },
+            // What the source says about itself, which is what the lag
+            // verdict is made on. Shown next to `data age` so the two can
+            // be compared: they answer different questions and were taken
+            // for one another through three rounds of this.
+            height = match s.health_height() {
+                None => "&mdash;".to_string(),
+                Some(h) => group(h),
+            },
+            hcls = if s.health_height().is_some() && !s.health_ready() { "over" } else { "num" },
             packets = group(s.packets.load(Relaxed)),
             disc = group(s.disconnects.load(Relaxed)),
             wins = group(s.wins.load(Relaxed)),
@@ -686,7 +739,7 @@ th{background:#1c1c1c}
     ));
 
     out.push_str("<div class='cap c1'>Data connections &mdash; cumulative since start</div>\n<table>\n");
-    out.push_str("<tr><th>node</th><th>endpoint</th><th>state</th><th>last data</th><th>data age</th><th>packets</th><th>disc</th><th>wins</th><th>dups</th><th>stale</th><th>too old</th><th>avg delay (ms)</th><th>delay histogram</th></tr>\n");
+    out.push_str("<tr><th>node</th><th>endpoint</th><th>state</th><th>last data</th><th>data age</th><th>height</th><th>packets</th><th>disc</th><th>wins</th><th>dups</th><th>stale</th><th>too old</th><th>avg delay (ms)</th><th>delay histogram</th></tr>\n");
     out.push_str(&cum_rows);
     out.push_str("</table>\n");
 

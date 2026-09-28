@@ -1,6 +1,6 @@
 //! WSARB — websocket arbitration proxy for `order_book_server` feeds.
 
-use wsarb::{client, state, stats, upstream};
+use wsarb::{client, health, state, stats, upstream};
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -44,19 +44,23 @@ struct Args {
     /// disable if they ever do not.
     #[arg(long = "max-age", default_value_t = 60)]
     max_age: u64,
-    /// Move clients off a source whose data has fallen this many seconds behind
-    /// the freshest source's, in seconds. 0 disables it.
+    /// Move clients off a source whose book has fallen this many blocks behind
+    /// the furthest-ahead source. 0 disables it.
     ///
     /// The other half of the silence watchdog. A node that dies goes quiet and
     /// is caught by silence; a node that restarts and replays blocks stays loud
     /// while serving a book minutes old, and nothing arrival-based can see it.
-    /// Judged against the other sources rather than the clock, so a quiet market
-    /// — which ages every source at once — is not mistaken for a fault.
     ///
-    /// The default is five times the measured p99 age of a healthy node
-    /// (~650ms) and well inside `--max-age`.
-    #[arg(long = "lag-limit", default_value_t = 3)]
-    lag_limit: u64,
+    /// Blocks, read from each source's own `GET /health`, because every attempt
+    /// to infer this from the stream measured something else. Blocks also mean
+    /// no clock is involved: two heights are compared to each other, never to
+    /// the time here. Judged against the other sources, so a quiet market —
+    /// where nothing advances anywhere — is not mistaken for a fault.
+    ///
+    /// At ~14 blocks a second the default is about 3.5s. Healthy sources sit
+    /// within a block or two of each other.
+    #[arg(long = "lag-blocks", default_value_t = 50)]
+    lag_blocks: u64,
 }
 
 /// Windows of silence before the connection is bounced once, and how often to
@@ -72,6 +76,14 @@ const SILENT_RECONNECT_EVERY: u64 = 60;
 /// settle, so the next verdict is made on a quiet system rather than on the
 /// wreckage of the last one.
 const LAG_COOLDOWN: Duration = Duration::from_secs(30);
+
+/// How often each source is asked where it stands, and how long it gets to
+/// answer. The endpoint is lock-free on the server side and the reply is one
+/// short line, so this costs a socket and a few hundred bytes twice a second;
+/// the timeout is generous because a slow answer is not a wrong one, and a
+/// missed poll simply means no measurement this round.
+const HEALTH_POLL_EVERY: Duration = Duration::from_millis(500);
+const HEALTH_POLL_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Strip a source of the streams it is leading and rebuild its clients from a
 /// snapshot taken elsewhere. Shared by the two watchdogs: a source can fail by
@@ -119,9 +131,9 @@ async fn main() -> anyhow::Result<()> {
     if let Some(d) = max_age {
         tracing::info!(seconds = d.as_secs(), "refusing frames older than this");
     }
-    let lag_limit = (args.lag_limit > 0).then(|| Duration::from_secs(args.lag_limit));
-    if let Some(d) = lag_limit {
-        tracing::info!(seconds = d.as_secs(), "moving clients off a source behind the others by this");
+    let lag_blocks = (args.lag_blocks > 0).then_some(args.lag_blocks);
+    if let Some(n) = lag_blocks {
+        tracing::info!(blocks = n, "moving clients off a source behind the others by this");
     }
     let state = Arc::new(AppState::new(sources, max_age));
 
@@ -184,7 +196,37 @@ async fn main() -> anyhow::Result<()> {
     // Its own ticker, at one second rather than the five the window above runs
     // at: that one is paced by the silence resolution, and a book minutes stale
     // should not wait on it. The check itself is two atomic loads per source.
-    if let Some(limit) = lag_limit {
+    if lag_blocks.is_some() {
+        // One poller per source: a slow or unreachable one must not delay the
+        // others' measurements, which is the whole point of asking each source
+        // directly rather than inferring from a shared stream.
+        for src in &state.sources {
+            let src = src.clone();
+            match health::health_url(&src.url) {
+                Some(url) => {
+                    tracing::info!(source = src.id, %url, "polling the source for its height");
+                    tokio::spawn(async move {
+                        let mut ticker = tokio::time::interval(HEALTH_POLL_EVERY);
+                        loop {
+                            ticker.tick().await;
+                            match health::poll(&url, HEALTH_POLL_TIMEOUT).await {
+                                Some(h) => src.stats.record_health(h.height, h.is_ready()),
+                                None => src.stats.record_health_failure(),
+                            }
+                        }
+                    });
+                }
+                None => tracing::warn!(
+                    source = src.id,
+                    url = %src.url,
+                    "no health endpoint can be derived from this address (TLS is not supported here); \
+                     this source will never be marked behind"
+                ),
+            }
+        }
+    }
+
+    if let Some(limit) = lag_blocks {
         let state = state.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_secs(1));
