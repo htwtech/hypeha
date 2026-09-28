@@ -2,7 +2,7 @@
 
 use wsarb::{client, state, stats, upstream};
 
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -81,17 +81,14 @@ fn take_clients_off(state: &Arc<AppState>, id: usize, why: &'static str) -> usiz
     if work.is_empty() {
         return 0;
     }
-    // Grouped by subscription before fetching: everyone parked here wants the
-    // same book from the same moment, and one fetch serves them all. Ungrouped
-    // this opened a connection per client -- 145 at once on a real resync.
-    let mut by_key: HashMap<state::SubKey, Vec<u64>> = HashMap::new();
-    for (key, client_id) in work {
-        by_key.entry(key).or_default().push(client_id);
-    }
-    let clients: usize = by_key.values().map(Vec::len).sum();
-    tracing::warn!(source = id, clients, subs = by_key.len(), "{}", why);
-    for (key, client_ids) in by_key {
-        tokio::spawn(upstream::fetch_snapshot_for(state.clone(), key, client_ids));
+    // One fetch per subscription, not per client: everyone parked here wants
+    // the same book from the same moment. Ungrouped this opened a connection
+    // per client -- 145 at once on a real resync.
+    let clients = work.len();
+    let keys: HashSet<state::SubKey> = work.into_iter().map(|(key, _)| key).collect();
+    tracing::warn!(source = id, clients, subs = keys.len(), "{}", why);
+    for key in keys {
+        tokio::spawn(upstream::fetch_snapshot(state.clone(), key));
     }
     clients
 }

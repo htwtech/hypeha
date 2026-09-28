@@ -280,6 +280,14 @@ struct Pending {
     /// only that node's increments belong on top of it.
     held: VecDeque<(usize, u64, Utf8Bytes)>,
     bytes: usize,
+    /// When this client was parked, which decides which fetches may serve it.
+    ///
+    /// A snapshot is only safe for a client that was already parked when the
+    /// fetch for it began: everything the snapshot does not contain is then in
+    /// this client's `held`. Park later than that and the frames between the
+    /// snapshot's height and the parking are in neither -- a hole, and a silent
+    /// one, which is the whole thing parking exists to prevent.
+    parked_at: Instant,
 }
 
 /// Per-subscription arbitration state and the set of clients subscribed to it.
@@ -410,6 +418,16 @@ pub struct AppState {
     pub subs: DashMap<SubKey, SubEntry>,
     pub clients: DashMap<u64, Arc<Client>>,
     pub next_client_id: AtomicU64,
+    /// Keys with a snapshot fetch in flight, and when it started.
+    ///
+    /// One at a time per key. Clients arriving while one runs simply wait: the
+    /// fetch that is running cannot serve them (it began before they parked, so
+    /// the frames between its snapshot and their parking are in neither), but
+    /// the one started the moment it finishes can, and serves them together.
+    /// Measured on a live server, 4 165 late joiners in ten minutes asked for
+    /// one and the same subscription, each opening its own connection to a node
+    /// for the same book.
+    fetching: DashMap<SubKey, Instant>,
     /// The pinned probe's key, once one has been pinned. Frames on this key are
     /// what the sources are compared by — see `lagging_sources`. Without a probe
     /// (`--no-probe`) every frame counts instead, which compares the sources on
@@ -444,8 +462,34 @@ impl AppState {
             subs: DashMap::new(),
             clients: DashMap::new(),
             next_client_id: AtomicU64::new(1),
+            fetching: DashMap::new(),
             probe: OnceLock::new(),
         }
+    }
+
+    /// Claim the right to fetch a snapshot for `key`, returning the instant the
+    /// claim was taken. `None` means somebody is already fetching: park and
+    /// wait, and either that fetch or the one it hands over to will serve you.
+    pub fn begin_fetch(&self, key: &SubKey) -> Option<Instant> {
+        match self.fetching.entry(key.clone()) {
+            dashmap::mapref::entry::Entry::Occupied(_) => None,
+            dashmap::mapref::entry::Entry::Vacant(slot) => {
+                let started = Instant::now();
+                slot.insert(started);
+                Some(started)
+            }
+        }
+    }
+
+    /// Give up the claim. True when clients are still parked on this key --
+    /// they arrived while the fetch ran, so it could not serve them and they
+    /// need one of their own.
+    ///
+    /// The claim is dropped first and the queue read second, so a client
+    /// parking in between takes the claim itself rather than being forgotten.
+    pub fn end_fetch(&self, key: &SubKey) -> bool {
+        self.fetching.remove(key);
+        self.subs.get(key).is_some_and(|e| !e.pending.is_empty())
     }
 
     /// Whether this key is the one the sources are judged by. True for every
@@ -488,7 +532,12 @@ impl AppState {
         // `pending` while the frames it will need pile up behind it.
         if !need_upstream && key.is_incremental() {
             if !entry.pending.iter().any(|p| p.client.id == client.id) {
-                entry.pending.push(Pending { client: client.clone(), held: VecDeque::new(), bytes: 0 });
+                entry.pending.push(Pending {
+                    client: client.clone(),
+                    held: VecDeque::new(),
+                    bytes: 0,
+                    parked_at: Instant::now(),
+                });
             }
         } else if !entry.subscribers.iter().any(|c| c.id == client.id) {
             entry.subscribers.push(client.clone());
@@ -800,30 +849,43 @@ impl AppState {
     /// Everything held at or below the snapshot's own height is already baked
     /// into it and would be applied twice, so it is discarded.
     pub fn deliver_snapshot(&self, key: &SubKey, client_id: u64, source: usize, height: u64, snapshot: Utf8Bytes) {
-        self.deliver_snapshot_all(key, &[client_id], source, height, &snapshot);
+        self.deliver_snapshot_to(key, source, height, &snapshot, |p| p.client.id == client_id);
     }
 
-    /// Hand one fetched snapshot to several clients parked on the same key.
+    /// Hand one fetched snapshot to every client that was already waiting when
+    /// the fetch began.
     ///
-    /// A resync parks every subscriber of a key at the same instant, and each
-    /// used to send its own fetch: 145 clients meant 145 throwaway connections
-    /// asking the same node the same question for the same 72 KB of book, all
-    /// within a second. That load is what stalled the readers and made the lag
-    /// watchdog fire again, so collapsing it is part of the fix and not a
-    /// tidy-up.
+    /// Each parked client used to send a fetch of its own: a resync of 145
+    /// clients opened 145 throwaway connections asking one node for the same
+    /// 72 KB within a second, and 4 165 late joiners in ten minutes did the
+    /// same for one subscription. That load is what stalled the readers into
+    /// looking like lagging nodes, so collapsing it is part of the fix and not
+    /// a tidy-up.
     ///
-    /// Only the clients named in `client_ids` are served, never simply whoever
-    /// is in `pending` now. A client that parked *after* this snapshot was
-    /// taken has no held frames from before it, so giving it this snapshot
+    /// Served are exactly the clients parked before `fetch_start`, never simply
+    /// whoever is in `pending` now. A client that parked *after* the fetch
+    /// began has no held frames from before the snapshot, so giving it this one
     /// would leave a hole between the two -- exactly the silent corruption the
-    /// parking exists to prevent.
-    pub fn deliver_snapshot_all(
+    /// parking exists to prevent. Those wait for the next fetch.
+    pub fn deliver_snapshot_since(
         &self,
         key: &SubKey,
-        client_ids: &[u64],
+        fetch_start: Instant,
         source: usize,
         height: u64,
         snapshot: &Utf8Bytes,
+    ) {
+        self.deliver_snapshot_to(key, source, height, snapshot, |p| p.parked_at < fetch_start);
+    }
+
+    /// The delivery itself: every parked client `wanted` says yes to.
+    fn deliver_snapshot_to(
+        &self,
+        key: &SubKey,
+        source: usize,
+        height: u64,
+        snapshot: &Utf8Bytes,
+        mut wanted: impl FnMut(&Pending) -> bool,
     ) {
         // (client, its own backlog): the snapshot is shared, the held frames
         // behind it are not -- each client parked with its own queue.
@@ -835,10 +897,12 @@ impl AppState {
             // not apply to this one. Elsewhere every source's frames are
             // equally valid, which is the point of racing them.
             let single = key.single_sourced();
-            for id in client_ids {
-                let Some(idx) = entry.pending.iter().position(|p| p.client.id == *id) else {
+            // Walk from the back so removing does not shift what is still to
+            // be looked at.
+            for idx in (0..entry.pending.len()).rev() {
+                if !wanted(&entry.pending[idx]) {
                     continue;
-                };
+                }
                 let Pending { client, held, .. } = entry.pending.remove(idx);
                 let mut backlog = vec![snapshot.clone()];
                 backlog.extend(
@@ -974,6 +1038,9 @@ impl AppState {
     /// but would require assuming both nodes order a block identically, which
     /// is exactly the assumption this design avoids.
     pub fn resync_after_source_loss(&self, source_id: usize) -> Vec<(SubKey, u64)> {
+        // One instant for the whole sweep: everyone it parks was parked
+        // together, and a fetch started after it can serve all of them.
+        let now = Instant::now();
         let mut work = Vec::new();
         for mut entry in self.subs.iter_mut() {
             if entry.block_leader != Some(source_id) {
@@ -1010,7 +1077,7 @@ impl AppState {
             for client in orphaned {
                 tracing::warn!(client = client.id, sub = %key.label(), "block leader lost mid-block, resyncing");
                 work.push((key.clone(), client.id));
-                entry.pending.push(Pending { client, held: VecDeque::new(), bytes: 0 });
+                entry.pending.push(Pending { client, held: VecDeque::new(), bytes: 0, parked_at: now });
             }
         }
         work
@@ -1020,13 +1087,26 @@ impl AppState {
     /// snapshot under it would look fine and be silently wrong, so the client
     /// is disconnected instead.
     pub fn fail_pending(&self, key: &SubKey, client_id: u64) {
-        let mut client = None;
+        self.fail_pending_where(key, |p| p.client.id == client_id);
+    }
+
+    /// Give up on everyone the failed fetch was meant to serve -- those parked
+    /// before it began. Anyone who joined the queue since keeps waiting: the
+    /// next fetch is theirs, and it may well succeed.
+    pub fn fail_pending_since(&self, key: &SubKey, fetch_start: Instant) {
+        self.fail_pending_where(key, |p| p.parked_at < fetch_start);
+    }
+
+    fn fail_pending_where(&self, key: &SubKey, mut wanted: impl FnMut(&Pending) -> bool) {
+        let mut giving_up: Vec<Arc<Client>> = Vec::new();
         if let Some(mut entry) = self.subs.get_mut(key) {
-            if let Some(idx) = entry.pending.iter().position(|p| p.client.id == client_id) {
-                client = Some(entry.pending.remove(idx).client);
+            for idx in (0..entry.pending.len()).rev() {
+                if wanted(&entry.pending[idx]) {
+                    giving_up.push(entry.pending.remove(idx).client);
+                }
             }
         }
-        if let Some(c) = client {
+        for c in giving_up {
             tracing::warn!(
                 client = c.id,
                 sub = %key.label(),
@@ -1531,12 +1611,10 @@ mod tests {
         // Three clients following `a`. The first opens the stream; the other
         // two join it and are attached by a snapshot of their own.
         let mut rxs = Vec::new();
-        let mut ids = Vec::new();
         for _ in 0..3 {
             let (client, rx) = state.register_client("t".into());
             state.subscribe(&client, key.clone());
             state.deliver_snapshot(&key, client.id, a.id, 0, msg("joined"));
-            ids.push(client.id);
             rxs.push(rx);
         }
         state.on_update(&a, key.clone(), Seq::Sticky(11), msg("11-a"));
@@ -1553,7 +1631,7 @@ mod tests {
         // One fetch, one delivery. Per client this was one throwaway connection
         // each -- 145 of them on a real resync, which is the load that stalled
         // the readers in the first place.
-        state.deliver_snapshot_all(&key, &ids, b.id, 11, &msg("snap-b"));
+        state.deliver_snapshot_since(&key, Instant::now(), b.id, 11, &msg("snap-b"));
         for rx in &mut rxs {
             assert_eq!(drain(rx), vec!["snap-b", "12-b"], "snapshot then its own held frames");
         }
@@ -1561,7 +1639,7 @@ mod tests {
     }
 
     #[test]
-    fn a_snapshot_is_not_given_to_a_client_that_parked_after_it_was_taken() {
+    fn a_snapshot_is_not_given_to_a_client_that_parked_after_the_fetch_began() {
         // The client parked later has no held frames from before the snapshot,
         // so handing it that snapshot would leave a hole between the two --
         // silently, which is the whole thing parking exists to prevent.
@@ -1575,14 +1653,64 @@ mod tests {
         drain(&mut early_rx);
         state.resync_after_source_loss(a.id);
 
-        // A second client joins while the fetch for the first is in flight.
-        let (late, mut late_rx) = state.register_client("t".into());
-        state.subscribe(&late, key.clone());
+        // The fetch for it starts...
+        let started = state.begin_fetch(&key).expect("nobody else is fetching");
+        // ...and a second client joins while it is in flight.
+        let (_late, mut late_rx) = state.register_client("t".into());
+        state.subscribe(&_late, key.clone());
 
-        // The fetch names only who it was sent for.
-        state.deliver_snapshot_all(&key, &[early.id], a.id, 11, &msg("snap"));
+        state.deliver_snapshot_since(&key, started, a.id, 11, &msg("snap"));
         assert_eq!(drain(&mut early_rx), vec!["snap"]);
         assert!(drain(&mut late_rx).is_empty(), "the late one waits for its own");
+
+        // ...which is why the fetch has to hand over to another one.
+        assert!(state.end_fetch(&key), "somebody is still waiting");
+        assert!(state.subs.get(&key).is_some_and(|e| e.pending.len() == 1));
+    }
+
+    #[test]
+    fn only_one_snapshot_fetch_per_subscription_at_a_time() {
+        // 4 165 late joiners in ten minutes asked for one and the same
+        // subscription, each opening its own connection to a node for the same
+        // book. Whoever arrives while a fetch runs waits for the next one
+        // instead of starting a third.
+        let state = test_state(1);
+        let key = SubKey::L2Diff { coin: "BTC".into(), n_sig_figs: None, n_levels: None, mantissa: None };
+
+        let first = state.begin_fetch(&key).expect("the first claim is granted");
+        assert!(state.begin_fetch(&key).is_none(), "a second fetch must not start");
+
+        // Nobody waiting once it finishes: no hand-over, and the key is free
+        // again for whoever comes next.
+        assert!(!state.end_fetch(&key));
+        let second = state.begin_fetch(&key).expect("free again");
+        assert!(second >= first);
+
+        // A different subscription is never blocked by this one.
+        let other = SubKey::L2Diff { coin: "ETH".into(), n_sig_figs: None, n_levels: None, mantissa: None };
+        assert!(state.begin_fetch(&other).is_some());
+    }
+
+    #[test]
+    fn a_fetch_hands_over_to_the_next_when_someone_is_still_waiting() {
+        let state = test_state(1);
+        let key = SubKey::L4Book { coin: "BTC".into() };
+        let (first, _rx) = state.register_client("t".into());
+        assert_eq!(state.subscribe(&first, key.clone()), SubscribeOutcome::Fresh);
+
+        // A late joiner parks, and its fetch begins.
+        let (late, mut late_rx) = state.register_client("t".into());
+        assert_eq!(state.subscribe(&late, key.clone()), SubscribeOutcome::Joined);
+        let started = state.begin_fetch(&key).expect("claim");
+
+        // It fails outright -- no source could answer. Only the clients that
+        // fetch was for are given up on.
+        let (later, _later_rx) = state.register_client("t".into());
+        state.subscribe(&later, key.clone());
+        state.fail_pending_since(&key, started);
+
+        assert!(drain(&mut late_rx).is_empty());
+        assert!(state.end_fetch(&key), "the one that joined meanwhile still needs a fetch");
         assert!(state.subs.get(&key).is_some_and(|e| e.pending.len() == 1));
     }
 

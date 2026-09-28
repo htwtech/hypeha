@@ -159,9 +159,12 @@ pub async fn run(state: Arc<AppState>, src: Arc<Source>, mut ctrl_rx: mpsc::Unbo
                 tracing::warn!(source = src.id, "disconnected");
 
                 // Anyone this source was mid-block for now has an incomplete
-                // book and must be rebuilt from a fresh snapshot.
-                for (key, client_id) in state.resync_after_source_loss(src.id) {
-                    tokio::spawn(fetch_snapshot(state.clone(), key, client_id));
+                // book and must be rebuilt from a fresh snapshot. One fetch per
+                // subscription, however many clients are behind it.
+                let keys: std::collections::HashSet<SubKey> =
+                    state.resync_after_source_loss(src.id).into_iter().map(|(key, _)| key).collect();
+                for key in keys {
+                    tokio::spawn(fetch_snapshot(state.clone(), key));
                 }
             }
             Err(e) => {
@@ -226,38 +229,49 @@ pub fn rank_snapshot_sources(state: &AppState) -> Vec<(usize, String)> {
     ranked.into_iter().map(|(_, _, id, url)| (id, url)).collect()
 }
 
-/// Fetch a private snapshot for a client that joined an already-running
-/// incremental stream, and hand it over.
+/// Serve everyone parked on `key`, one fetch at a time.
 ///
 /// A repeat `subscribe` on the shared connection is a no-op upstream (the
-/// server dedupes per connection and only snapshots on first insert), so this
-/// opens a throwaway connection of its own.
-pub async fn fetch_snapshot(state: Arc<AppState>, key: SubKey, client_id: u64) {
-    fetch_snapshot_for(state, key, vec![client_id]).await;
-}
-
-/// One snapshot for every client a resync parked on the same key at the same
-/// moment.
+/// server dedupes per connection and only snapshots on first insert), so each
+/// fetch opens a throwaway connection of its own — which is exactly why there
+/// must not be one per client.
 ///
-/// They were all parked together and all need the same book, so they can share
-/// one fetch. Per client it was one throwaway connection each: a resync of 145
-/// clients opened 145 of them within a second, asking the same node for the
-/// same 72 KB, and that load is what stalled the readers into looking like
-/// lagging nodes. One fetch, one delivery, whatever the crowd.
-pub async fn fetch_snapshot_for(state: Arc<AppState>, key: SubKey, client_ids: Vec<u64>) {
-    for (id, url) in rank_snapshot_sources(&state) {
-        match tokio::time::timeout(SNAPSHOT_TIMEOUT, snapshot_from(&url, &key)).await {
-            Ok(Some((height, payload))) => {
-                state.deliver_snapshot_all(&key, &client_ids, id, height, &payload);
-                return;
-            }
-            Ok(None) => tracing::warn!(url = %url, sub = %key.label(), "snapshot fetch failed"),
-            Err(_) => tracing::warn!(url = %url, sub = %key.label(), "snapshot fetch timed out"),
-        }
-    }
+/// Called after parking a client, from wherever the parking happened. At most
+/// one fetch per key runs: a client that arrives while one is in flight cannot
+/// be served by it -- the frames between that snapshot and its parking are in
+/// neither -- so it waits, and the fetch started the moment this one finishes
+/// takes it, together with everyone else who arrived meanwhile.
+///
+/// The batching is therefore free of any timer, and grows by itself with load:
+/// the busier the node, the longer each fetch takes and the more clients one
+/// serves. Measured on a live server the same subscription was asked for 4 165
+/// times in ten minutes, each with its own connection.
+pub async fn fetch_snapshot(state: Arc<AppState>, key: SubKey) {
+    loop {
+        // Somebody else is already fetching for this key; whoever we parked
+        // will be served by that fetch or by the one it hands over to.
+        let Some(started) = state.begin_fetch(&key) else { return };
 
-    for client_id in client_ids {
-        state.fail_pending(&key, client_id);
+        let mut served = false;
+        for (id, url) in rank_snapshot_sources(&state) {
+            match tokio::time::timeout(SNAPSHOT_TIMEOUT, snapshot_from(&url, &key)).await {
+                Ok(Some((height, payload))) => {
+                    state.deliver_snapshot_since(&key, started, id, height, &payload);
+                    served = true;
+                    break;
+                }
+                Ok(None) => tracing::warn!(url = %url, sub = %key.label(), "snapshot fetch failed"),
+                Err(_) => tracing::warn!(url = %url, sub = %key.label(), "snapshot fetch timed out"),
+            }
+        }
+        if !served {
+            state.fail_pending_since(&key, started);
+        }
+
+        // Anyone left arrived while that ran and needs a fetch of their own.
+        if !state.end_fetch(&key) {
+            return;
+        }
     }
 }
 

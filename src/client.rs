@@ -99,7 +99,7 @@ fn handle_request(state: &Arc<AppState>, client: &Arc<Client>, text: &str) {
             // is parked and its frames are held back.
             if outcome == SubscribeOutcome::Joined && key.is_incremental() {
                 tracing::info!(client = client.id, sub = %key.label(), "late joiner, fetching a snapshot");
-                tokio::spawn(crate::upstream::fetch_snapshot(state.clone(), key, client.id));
+                tokio::spawn(crate::upstream::fetch_snapshot(state.clone(), key));
             }
         }
         ClientMessage::Unsubscribe { subscription } => {
