@@ -417,7 +417,7 @@ pub fn render_page(state: &crate::state::AppState) -> String {
         let lagging = connected && s.is_lagging();
         cum_rows.push_str(&format!(
             "<tr><td class=nd>{node}</td><td>{url}</td>\
-             <td class={cls}>{state_txt}</td><td>{last_data}</td><td>{age}</td><td>{packets}</td><td>{disc}</td>\
+             <td class={cls}>{state_txt}</td><td>{last_data}</td><td title=\"{peak}\">{age}</td><td>{packets}</td><td>{disc}</td>\
              <td class=num>{wins}</td><td class=num>{dups}</td><td class=num>{stale}</td><td class={oldcls}>{old}</td><td>{avg:.1}</td><td class=hist>{hist}</td></tr>",
             node = format!("node{}", src.id + 1),
             url = html_escape(&src.url),
@@ -447,6 +447,12 @@ pub fn render_page(state: &crate::state::AppState) -> String {
                 Some(d) if lagging => format!("<span class=over>{:.1}s</span>", d.as_secs_f64()),
                 Some(d) if d < Duration::from_secs(1) => format!("{}ms", d.as_millis()),
                 Some(d) => format!("{:.1}s", d.as_secs_f64()),
+            },
+            // The worst this source has ever been, on hover. The column itself
+            // is the present moment, which is what the verdict is made on.
+            peak = match s.peak_age() {
+                None => "no data yet".to_string(),
+                Some(d) => format!("worst since start: {:.1}s", d.as_secs_f64()),
             },
             packets = group(s.packets.load(Relaxed)),
             disc = group(s.disconnects.load(Relaxed)),
