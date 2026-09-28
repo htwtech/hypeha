@@ -3,7 +3,7 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use axum::extract::ws::Utf8Bytes;
@@ -410,6 +410,11 @@ pub struct AppState {
     pub subs: DashMap<SubKey, SubEntry>,
     pub clients: DashMap<u64, Arc<Client>>,
     pub next_client_id: AtomicU64,
+    /// The pinned probe's key, once one has been pinned. Frames on this key are
+    /// what the sources are compared by — see `lagging_sources`. Without a probe
+    /// (`--no-probe`) every frame counts instead, which compares the sources on
+    /// whatever the clients happen to be subscribed to: workable, but noisier.
+    probe: OnceLock<SubKey>,
 }
 
 /// How many pending messages we buffer per client.
@@ -429,7 +434,14 @@ impl AppState {
             subs: DashMap::new(),
             clients: DashMap::new(),
             next_client_id: AtomicU64::new(1),
+            probe: OnceLock::new(),
         }
+    }
+
+    /// Whether this key is the one the sources are judged by. True for every
+    /// key when no probe is pinned.
+    pub fn is_probe_key(&self, key: &SubKey) -> bool {
+        self.probe.get().map_or(true, |p| p == key)
     }
 
     /// Register a new client and return its handle together with the receiver
@@ -495,6 +507,10 @@ impl AppState {
     /// steadily rather than in bursts, and so makes a better latency probe than
     /// the heavier channels while costing almost nothing.
     pub fn pin(&self, key: SubKey) {
+        // Also the yardstick for lag: one channel, one coin, present on every
+        // source whatever the clients are doing. The first pin wins, so a later
+        // one cannot move the measurement out from under the watchdog.
+        let _ = self.probe.set(key.clone());
         let mut entry = self.subs.entry(key.clone()).or_default();
         entry.pinned = true;
         let need_upstream = !entry.upstream_subscribed;
@@ -601,7 +617,25 @@ impl AppState {
             }
             Seq::Sticky(v) => match entry.block_leader {
                 // Nobody is leading: the first source to speak takes the stream
-                // and keeps it. This is also the path back after a resync.
+                // and keeps it. This is also the path back after a resync --
+                // which is exactly why "first to speak" is not enough on its
+                // own. A source is written off or marked behind at the moment
+                // its clients are taken away from it, and a node replaying
+                // blocks speaks more often than a healthy one, so the source
+                // just relieved of the stream is the one most likely to grab
+                // it back a millisecond later. Then it is found to be behind
+                // again, and the clients are rebuilt in a loop.
+                None if entry.needs_snapshot & source_bit(src.id) != 0 => {
+                    // Written off. Same rule as `Seq::Block`: its increments
+                    // cannot be trusted until it snapshots.
+                    stale = true;
+                }
+                None if src.stats.is_lagging() && self.has_healthy_source_besides(src.id) => {
+                    // Behind the others. Refused only while somebody healthier
+                    // could take the stream instead -- the last source standing
+                    // still serves, however far behind it is.
+                    stale = true;
+                }
                 None => {
                     entry.last = v;
                     entry.last_seen_at = now;
@@ -823,6 +857,66 @@ impl AppState {
             .filter(|s| s.stats.idle_for().is_some_and(|idle| idle > limit))
             .map(|s| s.id)
             .collect()
+    }
+
+    /// Whether some other connected source is not marked behind. Guards the
+    /// refusals that keep a lagging source off an unled stream, so that they
+    /// never leave a stream with nobody to carry it.
+    pub fn has_healthy_source_besides(&self, id: usize) -> bool {
+        self.sources
+            .iter()
+            .any(|s| s.id != id && s.stats.connected.load(Relaxed) && !s.stats.is_lagging())
+    }
+
+    /// Sources whose data has fallen behind the freshest source's, and which
+    /// are therefore serving their clients a book the chain has moved past.
+    ///
+    /// The other half of `silent_sources`: a node can fail by going quiet, or by
+    /// carrying on at the wrong height. The second is the one that hurts, and it
+    /// is invisible to every arrival-based measure — a node replaying blocks
+    /// after a restart is the *chattiest* source there is, so `idle_for` reads
+    /// zero while its book is minutes old.
+    ///
+    /// Judged relatively, for the same reason silence is: a quiet market ages
+    /// every source at once and that is not a fault, while a node that is
+    /// genuinely behind falls behind *the others*. That also guarantees the
+    /// freshest source is never in the returned list, so there is always
+    /// somewhere to move the clients to.
+    ///
+    /// Sets each source's `lagging` flag as it goes: the hot paths that hand a
+    /// stream to a source read it, and recomputing this per frame would mean
+    /// scanning every source on every message.
+    pub fn lagging_sources(&self, limit: Duration) -> Vec<usize> {
+        let freshest = self
+            .sources
+            .iter()
+            .filter(|s| s.stats.connected.load(Relaxed))
+            .filter_map(|s| s.stats.probe_block_ms())
+            .max();
+        let Some(freshest) = freshest else {
+            // Nothing has been measured yet: startup, or no probe and no
+            // subscribers. Nobody is behind anybody.
+            for src in &self.sources {
+                src.stats.set_lagging(false);
+            }
+            return Vec::new();
+        };
+        let limit_ms = limit.as_millis() as u64;
+        let mut behind = Vec::new();
+        for src in &self.sources {
+            // A source that has never spoken is not behind -- "never" is not
+            // "long ago", the same distinction `idle_for` makes.
+            let lagging = src.stats.connected.load(Relaxed)
+                && src
+                    .stats
+                    .probe_block_ms()
+                    .is_some_and(|t| freshest.saturating_sub(t) > limit_ms);
+            src.stats.set_lagging(lagging);
+            if lagging {
+                behind.push(src.id);
+            }
+        }
+        behind
     }
 
     /// A source that was leading an open block has gone away. Its subscribers
@@ -1294,6 +1388,137 @@ mod tests {
         deliver(0);
         tick();
         assert_eq!(state.silent_sources(limit), vec![1]);
+    }
+
+    /// Put a source's data at a block time, the way `record_block_time` does on
+    /// the arrival path.
+    fn at_block(state: &AppState, i: usize, block_ms: u64) {
+        let s = &state.sources[i].stats;
+        s.connected.store(true, Relaxed);
+        s.record_block_time(block_ms, block_ms + 200);
+    }
+
+    #[test]
+    fn a_quiet_market_is_not_mistaken_for_a_lagging_source() {
+        let state = test_state(2);
+        let limit = Duration::from_secs(3);
+
+        // Nothing measured yet: startup. Nobody is behind anybody.
+        assert!(state.lagging_sources(limit).is_empty());
+
+        // Both sit at the same block. However long ago that was -- a market
+        // that stopped trading ages every source together -- neither is at
+        // fault, and rebuilding every client here would be pure damage.
+        at_block(&state, 0, 1_000_000);
+        at_block(&state, 1, 1_000_000);
+        assert!(state.lagging_sources(limit).is_empty());
+        assert!(!state.sources[1].stats.is_lagging());
+    }
+
+    #[test]
+    fn the_source_behind_the_freshest_is_the_lagging_one() {
+        let state = test_state(2);
+        let limit = Duration::from_secs(3);
+
+        at_block(&state, 0, 1_000_000);
+        at_block(&state, 1, 1_000_000 - 4_000);
+        assert_eq!(state.lagging_sources(limit), vec![1]);
+        assert!(state.sources[1].stats.is_lagging());
+        assert!(!state.sources[0].stats.is_lagging(), "the freshest is never the one behind");
+
+        // It catches up: the mark comes off by itself, so nothing has to
+        // remember to clear it.
+        at_block(&state, 1, 1_000_000);
+        assert!(state.lagging_sources(limit).is_empty());
+        assert!(!state.sources[1].stats.is_lagging());
+    }
+
+    #[test]
+    fn a_source_that_has_never_spoken_is_not_lagging() {
+        let state = test_state(2);
+        state.sources[1].stats.connected.store(true, Relaxed);
+        at_block(&state, 0, 1_000_000);
+
+        // "Never" is not "long ago" -- the same distinction `idle_for` makes.
+        // A source that has yet to deliver cannot be serving anyone a stale book.
+        assert!(state.lagging_sources(Duration::from_secs(3)).is_empty());
+    }
+
+    #[test]
+    fn a_written_off_source_cannot_retake_a_sticky_stream() {
+        let state = test_state(2);
+        let key = SubKey::L2Diff { coin: "BTC".into(), n_sig_figs: None, n_levels: None, mantissa: None };
+        let (client, _rx) = state.register_client("t".into());
+        state.subscribe(&client, key.clone());
+
+        let a = state.sources[0].clone();
+        let b = state.sources[1].clone();
+
+        state.on_update(&a, key.clone(), Seq::Snapshot(10), msg("snap-a"));
+        state.on_update(&a, key.clone(), Seq::Sticky(11), msg("11-a"));
+
+        // `a` loses its clients: written off until it snapshots again.
+        state.resync_after_source_loss(a.id);
+        let wins_before = a.stats.wins.load(Relaxed);
+
+        // Its next increment must not put it back in charge. Sticky used to let
+        // it: the leaderless branch took the first source to speak, and the
+        // source that just lost the stream is the one speaking most.
+        state.on_update(&a, key.clone(), Seq::Sticky(12), msg("12-a"));
+        assert_eq!(a.stats.wins.load(Relaxed), wins_before, "a written-off source took the stream back");
+
+        // Anyone else may take it.
+        let b_wins = b.stats.wins.load(Relaxed);
+        state.on_update(&b, key.clone(), Seq::Sticky(12), msg("12-b"));
+        assert_eq!(b.stats.wins.load(Relaxed), b_wins + 1);
+    }
+
+    #[test]
+    fn a_lagging_source_cannot_retake_a_sticky_stream() {
+        let state = test_state(2);
+        let key = l2("BTC", None);
+        let (client, mut rx) = state.register_client("t".into());
+        state.subscribe(&client, key.clone());
+
+        let a = state.sources[0].clone();
+        let b = state.sources[1].clone();
+        a.stats.connected.store(true, Relaxed);
+        b.stats.connected.store(true, Relaxed);
+
+        state.on_update(&a, key.clone(), Seq::Sticky(10), msg("10-a"));
+        assert_eq!(drain(&mut rx), vec!["10-a"]);
+
+        // `a` falls behind and its clients are taken off it. On a self-contained
+        // channel that is just the leadership being freed -- and then `a`, busy
+        // replaying, is first to speak into the gap.
+        a.stats.set_lagging(true);
+        state.resync_after_source_loss(a.id);
+        state.on_update(&a, key.clone(), Seq::Sticky(11), msg("11-a"));
+        assert!(drain(&mut rx).is_empty(), "the stream went back to the source it was taken from");
+
+        // The healthy one gets it instead.
+        state.on_update(&b, key.clone(), Seq::Sticky(11), msg("11-b"));
+        assert_eq!(drain(&mut rx), vec!["11-b"]);
+    }
+
+    #[test]
+    fn the_last_source_standing_serves_however_far_behind() {
+        let state = test_state(2);
+        let key = l2("BTC", None);
+        let (client, mut rx) = state.register_client("t".into());
+        state.subscribe(&client, key.clone());
+
+        let a = state.sources[0].clone();
+        // Both marked behind cannot happen -- the verdict is relative, so the
+        // freshest source is never marked -- but the refusal must not be able to
+        // leave a stream with nobody to carry it.
+        for src in &state.sources {
+            src.stats.connected.store(true, Relaxed);
+            src.stats.set_lagging(true);
+        }
+
+        state.on_update(&a, key.clone(), Seq::Sticky(10), msg("10-a"));
+        assert_eq!(drain(&mut rx), vec!["10-a"], "a stale book beats no book at all");
     }
 
     #[test]

@@ -47,7 +47,7 @@ fn block_time_ms(text: &str) -> Option<u64> {
     text[j..end].parse().ok()
 }
 
-fn unix_ms() -> u64 {
+pub fn unix_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as u64)
@@ -174,6 +174,58 @@ pub async fn run(state: Arc<AppState>, src: Arc<Source>, mut ctrl_rx: mpsc::Unbo
     }
 }
 
+/// Which source to ask for a snapshot, best first.
+///
+/// Freshest first, judged by the data and not by the chatter.
+///
+/// Two ways a source answers a snapshot request with a book that is wrong to
+/// build on. A node whose process died still answers, instantly and with the
+/// book frozen at its last block. And a node replaying blocks after a restart
+/// answers with a book minutes behind the chain while being the *busiest*
+/// source there is — so ranking by how recently a source spoke picks exactly
+/// the node whose clients were just taken away from it, pins the stream back
+/// onto it, and the rebuild starts over a few seconds later. That loop is the
+/// reason this is not `idle_for` any more.
+///
+/// Anything marked behind goes last rather than being dropped: a stale book is
+/// still better than leaving the client parked forever, and with every source
+/// marked (which the relative verdict makes impossible, but still) the list must
+/// not come back empty.
+///
+/// The source id travels with the url: whoever answers becomes the leader, so
+/// the book's foundation and the increments laid on it come from one node.
+pub fn rank_snapshot_sources(state: &AppState) -> Vec<(usize, String)> {
+    let mut ranked: Vec<(bool, std::cmp::Reverse<u64>, usize, String)> = state
+        .sources
+        .iter()
+        .filter(|s| s.stats.connected.load(Relaxed))
+        .map(|s| {
+            (
+                s.stats.is_lagging(),
+                std::cmp::Reverse(s.stats.probe_block_ms().unwrap_or(0)),
+                s.id,
+                s.url.clone(),
+            )
+        })
+        .collect();
+    ranked.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+
+    // Nothing measured at all (startup, or `--no-probe` before any traffic):
+    // fall back to the older question, which source spoke most recently.
+    if ranked.iter().all(|(_, block, _, _)| block.0 == 0) {
+        ranked.sort_by_key(|(_, _, id, _)| {
+            state
+                .sources
+                .iter()
+                .find(|s| s.id == *id)
+                .and_then(|s| s.stats.idle_for())
+                .unwrap_or(Duration::MAX)
+        });
+    }
+
+    ranked.into_iter().map(|(_, _, id, url)| (id, url)).collect()
+}
+
 /// Fetch a private snapshot for a client that joined an already-running
 /// incremental stream, and hand it over.
 ///
@@ -181,33 +233,7 @@ pub async fn run(state: Arc<AppState>, src: Arc<Source>, mut ctrl_rx: mpsc::Unbo
 /// server dedupes per connection and only snapshots on first insert), so this
 /// opens a throwaway connection of its own.
 pub async fn fetch_snapshot(state: Arc<AppState>, key: SubKey, client_id: u64) {
-    // Freshest source first. A source whose node has died still answers, and
-    // answers with a book frozen at its last block - syntactically perfect and
-    // silently wrong to build on. Only fall back to a quiet source when none of
-    // them is delivering, which means the market is quiet and every book is
-    // equally current.
-    // The source id travels with the url: whoever answers becomes the leader,
-    // so the book's foundation and the increments laid on it come from one node.
-    let mut ranked: Vec<(Duration, usize, String)> = state
-        .sources
-        .iter()
-        .filter(|s| s.stats.connected.load(Relaxed))
-        .map(|s| (s.stats.idle_for().unwrap_or(Duration::MAX), s.id, s.url.clone()))
-        .collect();
-    ranked.sort_by_key(|(idle, _, _)| *idle);
-
-    let fresh: Vec<(usize, String)> = ranked
-        .iter()
-        .filter(|(idle, _, _)| *idle <= crate::stats::SILENCE_LIMIT)
-        .map(|(_, id, url)| (*id, url.clone()))
-        .collect();
-    let urls: Vec<(usize, String)> = if fresh.is_empty() {
-        ranked.into_iter().map(|(_, id, url)| (id, url)).collect()
-    } else {
-        fresh
-    };
-
-    for (id, url) in urls {
+    for (id, url) in rank_snapshot_sources(&state) {
         match tokio::time::timeout(SNAPSHOT_TIMEOUT, snapshot_from(&url, &key)).await {
             Ok(Some((height, payload))) => {
                 state.deliver_snapshot(&key, client_id, id, height, payload);
@@ -405,11 +431,18 @@ fn handle_text(state: &AppState, src: &Source, text: &str) {
                 );
                 return;
             }
-        }
 
-        if let Some(max) = state.max_age {
-            if let Some(t) = block_time_ms(text) {
-                let now = unix_ms();
+            // Where this source stands, for `lagging_sources` to compare. Taken
+            // here, on arrival, and deliberately above the age gate: a node
+            // frozen an hour ago has every frame refused below, and dropping it
+            // from the measurement too would leave the one source that is
+            // provably behind looking like it has no opinion. Above the gate it
+            // is measured, marked, and its clients are moved off it.
+            if state.is_probe_key(&key) {
+                src.stats.record_block_time(t, now);
+            }
+
+            if let Some(max) = state.max_age {
                 if now > t && now - t > max.as_millis() as u64 {
                     src.stats.too_old.fetch_add(1, Relaxed);
                     tracing::warn!(
@@ -531,7 +564,7 @@ mod tests {
         Some(match seq {
             Seq::Point(v) => (key, v, "point"),
             Seq::Block(v) => (key, v, "block"),
-            Seq::Snapshot(v) => (key, v, "snapshot"),
+            Seq::Snapshot(v) => (key, v, "snapshot"),
             Seq::Lead(v) => (key, v, "lead"),
             Seq::Sticky(v) => (key, v, "sticky"),
         })
@@ -661,5 +694,73 @@ mod tests {
             r#"{"channel":"subscriptionResponse","data":{"method":"subscribe","subscription":{"type":"l2Book","coin":"BTC"}}}"#
         )
         .is_none());
+    }
+
+    fn state_with(n: usize) -> AppState {
+        let sources = (0..n)
+            .map(|id| {
+                let (ctrl_tx, _rx) = mpsc::unbounded_channel();
+                let src = Source {
+                    id,
+                    url: format!("ws://src{id}"),
+                    stats: crate::stats::SourceStats::default(),
+                    ctrl_tx,
+                    reconnect: tokio::sync::Notify::new(),
+                };
+                src.stats.connected.store(true, Relaxed);
+                Arc::new(src)
+            })
+            .collect();
+        AppState::new(sources, None)
+    }
+
+    fn ids(v: Vec<(usize, String)>) -> Vec<usize> {
+        v.into_iter().map(|(id, _)| id).collect()
+    }
+
+    #[test]
+    fn a_snapshot_is_asked_of_the_source_with_the_newest_data() {
+        let state = state_with(3);
+        // Source 1 holds the newest block; source 2 is a minute behind but is
+        // the chattiest of the three, which is what a replaying node looks like.
+        state.sources[0].stats.record_block_time(1_000_000, 1_000_200);
+        state.sources[1].stats.record_block_time(1_002_000, 1_002_200);
+        state.sources[2].stats.record_block_time(940_000, 1_002_200);
+        assert_eq!(ids(rank_snapshot_sources(&state)), vec![1, 0, 2]);
+    }
+
+    #[test]
+    fn a_source_marked_behind_is_asked_last_but_still_asked() {
+        let state = state_with(2);
+        // The one with the newest data is also the one the watchdog has just
+        // marked behind -- it is replaying, so its block times run ahead of what
+        // it is actually serving. The mark wins over the number.
+        state.sources[0].stats.record_block_time(1_002_000, 1_002_200);
+        state.sources[0].stats.set_lagging(true);
+        state.sources[1].stats.record_block_time(1_000_000, 1_000_200);
+        assert_eq!(ids(rank_snapshot_sources(&state)), vec![1, 0]);
+
+        // Everything marked: the list must not come back empty, or the client
+        // waiting on the snapshot is parked for good.
+        state.sources[1].stats.set_lagging(true);
+        assert_eq!(ids(rank_snapshot_sources(&state)).len(), 2);
+    }
+
+    #[test]
+    fn with_nothing_measured_the_order_falls_back_to_who_spoke_last() {
+        let state = state_with(2);
+        // Startup, or `--no-probe` before any traffic: no block times at all.
+        // Source 1 has at least delivered something.
+        state.sources[1].stats.packets.fetch_add(1, Relaxed);
+        assert_eq!(ids(rank_snapshot_sources(&state)), vec![1, 0]);
+    }
+
+    #[test]
+    fn a_disconnected_source_is_not_asked() {
+        let state = state_with(2);
+        state.sources[0].stats.record_block_time(1_002_000, 1_002_200);
+        state.sources[0].stats.connected.store(false, Relaxed);
+        state.sources[1].stats.record_block_time(1_000_000, 1_000_200);
+        assert_eq!(ids(rank_snapshot_sources(&state)), vec![1]);
     }
 }

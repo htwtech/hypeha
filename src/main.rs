@@ -43,6 +43,19 @@ struct Args {
     /// disable if they ever do not.
     #[arg(long = "max-age", default_value_t = 60)]
     max_age: u64,
+    /// Move clients off a source whose data has fallen this many seconds behind
+    /// the freshest source's, in seconds. 0 disables it.
+    ///
+    /// The other half of the silence watchdog. A node that dies goes quiet and
+    /// is caught by silence; a node that restarts and replays blocks stays loud
+    /// while serving a book minutes old, and nothing arrival-based can see it.
+    /// Judged against the other sources rather than the clock, so a quiet market
+    /// — which ages every source at once — is not mistaken for a fault.
+    ///
+    /// The default is five times the measured p99 age of a healthy node
+    /// (~650ms) and well inside `--max-age`.
+    #[arg(long = "lag-limit", default_value_t = 3)]
+    lag_limit: u64,
 }
 
 /// Windows of silence before the connection is bounced once, and how often to
@@ -51,6 +64,19 @@ struct Args {
 /// genuinely dead node does not churn the connection or the disconnect count.
 const SILENT_RECONNECT_FIRST: u64 = 6;
 const SILENT_RECONNECT_EVERY: u64 = 60;
+
+/// Strip a source of the streams it is leading and rebuild its clients from a
+/// snapshot taken elsewhere. Shared by the two watchdogs: a source can fail by
+/// going quiet or by falling behind, and the cure is the same either way.
+fn take_clients_off(state: &Arc<AppState>, id: usize, why: &'static str) {
+    let work = state.resync_after_source_loss(id);
+    if !work.is_empty() {
+        tracing::warn!(source = id, clients = work.len(), "{}", why);
+    }
+    for (key, client_id) in work {
+        tokio::spawn(upstream::fetch_snapshot(state.clone(), key, client_id));
+    }
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -77,6 +103,10 @@ async fn main() -> anyhow::Result<()> {
     let max_age = (args.max_age > 0).then(|| Duration::from_secs(args.max_age));
     if let Some(d) = max_age {
         tracing::info!(seconds = d.as_secs(), "refusing frames older than this");
+    }
+    let lag_limit = (args.lag_limit > 0).then(|| Duration::from_secs(args.lag_limit));
+    if let Some(d) = lag_limit {
+        tracing::info!(seconds = d.as_secs(), "moving clients off a source behind the others by this");
     }
     let state = Arc::new(AppState::new(sources, max_age));
 
@@ -108,17 +138,11 @@ async fn main() -> anyhow::Result<()> {
                 // one that was leading an open block would strand its clients
                 // holding half a block, forever and silently.
                 for id in state.silent_sources(stats::SILENCE_LIMIT) {
-                    let work = state.resync_after_source_loss(id);
-                    if !work.is_empty() {
-                        tracing::warn!(
-                            source = id,
-                            clients = work.len(),
-                            "connected but silent while others deliver; rebuilding its clients"
-                        );
-                    }
-                    for (key, client_id) in work {
-                        tokio::spawn(upstream::fetch_snapshot(state.clone(), key, client_id));
-                    }
+                    take_clients_off(
+                        &state,
+                        id,
+                        "connected but silent while others deliver; rebuilding its clients",
+                    );
 
                     // The silence may be a dead node, or a subscription lost
                     // server-side on a socket that stayed up. Only the second is
@@ -134,6 +158,32 @@ async fn main() -> anyhow::Result<()> {
                             src.reconnect.notify_one();
                         }
                     }
+                }
+            }
+        });
+    }
+
+    // Background task: notice a source that keeps talking while its data falls
+    // behind the others'.
+    //
+    // Its own ticker, at one second rather than the five the window above runs
+    // at: that one is paced by the silence resolution, and a book minutes stale
+    // should not wait on it. The check itself is two atomic loads per source.
+    if let Some(limit) = lag_limit {
+        let state = state.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                ticker.tick().await;
+                for id in state.lagging_sources(limit) {
+                    // Only the first pass finds clients to move: `lagging` stays
+                    // set until the source catches up, but by then its entries
+                    // are led by somebody else and there is nothing to take.
+                    take_clients_off(
+                        &state,
+                        id,
+                        "data behind the freshest source; rebuilding its clients elsewhere",
+                    );
                 }
             }
         });

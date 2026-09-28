@@ -57,6 +57,21 @@ pub struct SourceStats {
     /// the key's high-water mark ahead of the clock and silence every real frame
     /// behind it until wall time caught up.
     pub from_future: AtomicU64,
+    /// Block time of the newest probe frame seen from this source, in unix ms.
+    /// Zero means it has not spoken yet — which is not the same as being behind.
+    ///
+    /// The yardstick for lag. Taken from one channel and one coin (the pinned
+    /// `bbo` probe) so the sources are compared on the same thing, and recorded
+    /// on arrival rather than on winning: a source that is behind loses every
+    /// race, and its frames are exactly the ones that reveal it.
+    probe_block_ms: AtomicU64,
+    /// Largest `now - block_time` ever seen from this source, in ms. Diagnostic
+    /// only: the lag verdict is relative, this is the absolute worst moment.
+    peak_age_ms: AtomicU64,
+    /// Set by the watchdog when this source's data has fallen behind the
+    /// freshest source's. Read on the hot paths that hand a stream to a source,
+    /// so that a source being written off cannot immediately take it back.
+    lagging: AtomicBool,
     delay_sum_us: AtomicU64,
     delay_count: AtomicU64,
     hist: [AtomicU64; NUM_BUCKETS],
@@ -93,6 +108,45 @@ impl SourceStats {
             return None;
         }
         Some(WINDOW * self.silent_windows.load(Relaxed) as u32)
+    }
+
+    /// Block time of the newest probe frame from this source, or `None` if it
+    /// has not delivered one yet.
+    pub fn probe_block_ms(&self) -> Option<u64> {
+        match self.probe_block_ms.load(Relaxed) {
+            0 => None,
+            ms => Some(ms),
+        }
+    }
+
+    /// Record one arriving frame's block time. `now` is passed in because the
+    /// caller has already read the clock for its own checks.
+    pub fn record_block_time(&self, block_ms: u64, now_ms: u64) {
+        self.probe_block_ms.fetch_max(block_ms, Relaxed);
+        if now_ms > block_ms {
+            self.peak_age_ms.fetch_max(now_ms - block_ms, Relaxed);
+        }
+    }
+
+    /// How old this source's newest data is, against the wall clock. Useful to
+    /// look at, but never to judge by: a quiet market ages every source at once.
+    pub fn age(&self, now_ms: u64) -> Option<Duration> {
+        self.probe_block_ms().map(|t| Duration::from_millis(now_ms.saturating_sub(t)))
+    }
+
+    pub fn peak_age(&self) -> Option<Duration> {
+        match self.peak_age_ms.load(Relaxed) {
+            0 => None,
+            ms => Some(Duration::from_millis(ms)),
+        }
+    }
+
+    pub fn is_lagging(&self) -> bool {
+        self.lagging.load(Relaxed)
+    }
+
+    pub fn set_lagging(&self, v: bool) {
+        self.lagging.store(v, Relaxed);
     }
 
     pub fn record_delay(&self, d: Duration) {
@@ -342,6 +396,10 @@ fn render_race_section(out: &mut String) {
 
 /// Render the HTML stats page from a snapshot of the shared state.
 pub fn render_page(state: &crate::state::AppState) -> String {
+    // Read once for the whole page, so the ages in a row are all measured from
+    // the same instant.
+    let now_ms = crate::upstream::unix_ms();
+
     // ---- Table 1: cumulative ----
     let mut cum_rows = String::new();
     for src in &state.sources {
@@ -352,18 +410,43 @@ pub fn render_page(state: &crate::state::AppState) -> String {
         // state, and it is the one worth noticing.
         let idle = s.idle_for();
         let silent = connected && idle.is_some_and(|d| d > SILENCE_LIMIT);
+        // Two different failures, two columns. `last data` is when the source
+        // last said anything — silence. `data age` is how old what it says is —
+        // a node replaying blocks scores perfectly on the first and terribly on
+        // the second, and it is the second that reaches the clients.
+        let lagging = connected && s.is_lagging();
         cum_rows.push_str(&format!(
             "<tr><td class=nd>{node}</td><td>{url}</td>\
-             <td class={cls}>{state_txt}</td><td>{last_data}</td><td>{packets}</td><td>{disc}</td>\
+             <td class={cls}>{state_txt}</td><td>{last_data}</td><td>{age}</td><td>{packets}</td><td>{disc}</td>\
              <td class=num>{wins}</td><td class=num>{dups}</td><td class=num>{stale}</td><td class={oldcls}>{old}</td><td>{avg:.1}</td><td class=hist>{hist}</td></tr>",
             node = format!("node{}", src.id + 1),
             url = html_escape(&src.url),
-            cls = if !connected { "down" } else if silent { "idle" } else { "up" },
-            state_txt = if !connected { "DOWN" } else if silent { "IDLE" } else { "UP" },
+            cls = if !connected {
+                "down"
+            } else if silent || lagging {
+                "idle"
+            } else {
+                "up"
+            },
+            state_txt = if !connected {
+                "DOWN"
+            } else if silent {
+                "IDLE"
+            } else if lagging {
+                "LAGGING"
+            } else {
+                "UP"
+            },
             last_data = match idle {
                 None => "&mdash;".to_string(),
                 Some(d) if d > SILENCE_LIMIT => format!("<span class=over>{:.0}s ago</span>", d.as_secs_f64()),
                 Some(d) => format!("{:.1}s ago", d.as_secs_f64()),
+            },
+            age = match s.age(now_ms) {
+                None => "&mdash;".to_string(),
+                Some(d) if lagging => format!("<span class=over>{:.1}s</span>", d.as_secs_f64()),
+                Some(d) if d < Duration::from_secs(1) => format!("{}ms", d.as_millis()),
+                Some(d) => format!("{:.1}s", d.as_secs_f64()),
             },
             packets = group(s.packets.load(Relaxed)),
             disc = group(s.disconnects.load(Relaxed)),
@@ -385,14 +468,30 @@ pub fn render_page(state: &crate::state::AppState) -> String {
         let s = &src.stats;
         let connected = s.connected.load(Relaxed);
         let silent = connected && s.idle_for().is_some_and(|d| d > SILENCE_LIMIT);
+        let lagging = connected && s.is_lagging();
         win_rows.push_str(&format!(
             "<tr><td class=nd>{node}</td><td>{url}</td>\
              <td class={cls}>{state_txt}</td><td>{packets}</td>\
              <td class=win>{wins}</td><td>{dups}</td><td>{stale}</td><td>{avg:.1}</td></tr>",
             node = format!("node{}", src.id + 1),
             url = html_escape(&src.url),
-            cls = if !connected { "down" } else if silent { "idle" } else { "up" },
-            state_txt = if !connected { "DOWN" } else if silent { "IDLE" } else { "UP" },
+            // Same three-way state as the cumulative table above.
+            cls = if !connected {
+                "down"
+            } else if silent || lagging {
+                "idle"
+            } else {
+                "up"
+            },
+            state_txt = if !connected {
+                "DOWN"
+            } else if silent {
+                "IDLE"
+            } else if lagging {
+                "LAGGING"
+            } else {
+                "UP"
+            },
             packets = s.d_packets.load(Relaxed),
             wins = s.d_wins.load(Relaxed),
             dups = s.d_dups.load(Relaxed),
@@ -546,7 +645,7 @@ th{background:#1c1c1c}
     ));
 
     out.push_str("<div class='cap c1'>Data connections &mdash; cumulative since start</div>\n<table>\n");
-    out.push_str("<tr><th>node</th><th>endpoint</th><th>state</th><th>last data</th><th>packets</th><th>disc</th><th>wins</th><th>dups</th><th>stale</th><th>too old</th><th>avg delay (ms)</th><th>delay histogram</th></tr>\n");
+    out.push_str("<tr><th>node</th><th>endpoint</th><th>state</th><th>last data</th><th>data age</th><th>packets</th><th>disc</th><th>wins</th><th>dups</th><th>stale</th><th>too old</th><th>avg delay (ms)</th><th>delay histogram</th></tr>\n");
     out.push_str(&cum_rows);
     out.push_str("</table>\n");
 

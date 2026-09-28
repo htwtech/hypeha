@@ -55,6 +55,8 @@ frame from a source socket
   → parse into Frame (tagged on "channel")
   → "error" → logged, dropped
   → route() → (SubKey, Seq)      subscription key + ordering value
+  → future check                 a stamp ahead of the clock is refused
+  → record where this source is  probe frames only, feeds --lag-limit
   → absolute freshness check     --max-age, counted as "too old"
   → arbitration                  the three modes below
   → fan out, and pile up behind any parked client
@@ -220,6 +222,12 @@ key. It catches a node replaying blocks it has already sent.
 past than `--max-age`. It catches what relative ordering structurally cannot —
 see [Refusing data from the past](#refusing-data-from-the-past).
 
+**`data age`** is how old the data a source is sending is, against the clock —
+not to be confused with `last data`, which is how long ago it last sent
+anything. A node replaying blocks scores perfectly on the second and terribly on
+the first; see [A source that talks while falling
+behind](#a-source-that-talks-while-falling-behind).
+
 #### Around the edges
 
 **The blacklist.** A source that falls silent mid-stamp is marked, and its
@@ -258,6 +266,7 @@ cargo run --release -- \
 - `--probe-coin <COIN>` — coin for the permanent `bbo` probe (default `BTC`).
 - `--no-probe` — drop the probe entirely.
 - `--max-age <SECS>` — refuse frames whose block time is older than this (default 60; 0 disables).
+- `--lag-limit <SECS>` — move clients off a source whose data has fallen this far behind the freshest source's (default 3; 0 disables).
 
 ### Refusing data from the past
 
@@ -299,17 +308,48 @@ evenly than the heavier channels. It shows on the dashboard marked `(probe)`.
 
 ### Live socket vs live data
 
-A source shows `UP` when connected and **`IDLE` when connected but no longer
-delivering**. The distinction matters: `order_book_server` reads the files its
-Hyperliquid node writes, so if that node dies the server keeps the websocket
-open and simply stops speaking. It does not replay old data — it sends nothing.
+A source shows `UP` when connected, **`IDLE` when connected but no longer
+delivering**, and **`LAGGING` when delivering data that has fallen behind the
+other sources**. Three states because there are three things that can be true of
+a socket, and only the first one is obvious from the outside.
 
-Silence alone is not a fault, though: a quiet market silences every source at
-once. A source is only treated as lost when it has gone quiet **while another
-source is still delivering**. When that happens its `l4Book` clients are rebuilt
-from a fresh snapshot, exactly as on a dropped connection — otherwise a source
-that was leading an open block would strand them holding half of it, forever and
-without a word in the log.
+`order_book_server` reads the files its Hyperliquid node writes, so if that node
+dies the server keeps the websocket open and simply stops speaking. That is
+`IDLE`. Silence alone is not a fault, though: a quiet market silences every
+source at once. A source is only treated as lost when it has gone quiet **while
+another source is still delivering**. When that happens its `l4Book` clients are
+rebuilt from a fresh snapshot, exactly as on a dropped connection — otherwise a
+source that was leading an open block would strand them holding half of it,
+forever and without a word in the log.
+
+### A source that talks while falling behind
+
+The other way a source fails, and the one that hides: it keeps sending, at the
+wrong height. A server that restarts, or re-syncs its book, replays the node's
+files from where the node last persisted its state — minutes of them — so it is
+the **busiest** source on the machine while serving a book the chain has long
+moved past. Every arrival-based measure reads it as the healthiest source there
+is: it never goes idle, it answers a snapshot request first, and it is first to
+speak into any stream left without a leader.
+
+On the single-sourced channels (`l2Book`, `l2Diff`) that is worse than useless.
+The client follows one source from end to end, so a leader replaying blocks
+delivers nothing it can use — its frames are older than what the client already
+holds — while the healthy source's frames are refused for not being the leader's.
+The stream simply stops, with a working node sitting right there.
+
+`--lag-limit` closes it. Each source's position is taken from the probe — one
+channel and one coin, so the comparison is between like and like — and a source
+whose data has fallen further behind the freshest source's than the limit is
+marked `LAGGING`, has its streams taken away, and has its clients rebuilt from a
+snapshot fetched **elsewhere**. It cannot take the stream back while marked, and
+it is not asked for the snapshot: the whole point is to stop handing the stream
+straight back to the node that just lost it.
+
+The rule is relative, like silence, and for the same reason — a market that
+stops trading ages every source at once and none of them is at fault. Which also
+guarantees the freshest source is never the one marked, so there is always
+somewhere to move the clients to.
 
 The same rule guards snapshot fetches: a node that has died still answers, with a
 book frozen at its last block. Snapshots are taken from the freshest source, and
