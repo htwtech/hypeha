@@ -1682,7 +1682,9 @@ mod tests {
 
         // One fetch, one delivery. Per client this was one throwaway connection
         // each -- 145 of them on a real resync, which is the load that stalled
-        // the readers in the first place.
+        // the readers in the first place. The sleep puts the fetch's start
+        // provably after the parking, on a clock of any granularity.
+        std::thread::sleep(Duration::from_millis(2));
         state.deliver_snapshot_since(&key, Instant::now(), b.id, 11, &msg("snap-b"));
         for rx in &mut rxs {
             assert_eq!(drain(rx), vec!["snap-b", "12-b"], "snapshot then its own held frames");
@@ -1701,13 +1703,20 @@ mod tests {
 
         let (early, mut early_rx) = state.register_client("t".into());
         state.subscribe(&early, key.clone());
-        state.deliver_snapshot(&key, early.id, a.id, 0, msg("joined"));
+        // `a` has to actually lead the stream, or the resync below finds
+        // nothing to take away and nobody is parked at all.
+        state.on_update(&a, key.clone(), Seq::Snapshot(10), msg("snap-a"));
         drain(&mut early_rx);
         state.resync_after_source_loss(a.id);
 
-        // The fetch for it starts...
+        // The fetch for it starts. The sleeps are what make "before" and
+        // "after" mean anything here: both are one `Instant::now()` apart, and
+        // a coarse clock would otherwise read them as the same moment.
+        std::thread::sleep(Duration::from_millis(2));
         let started = state.begin_fetch(&key).expect("nobody else is fetching");
-        // ...and a second client joins while it is in flight.
+        std::thread::sleep(Duration::from_millis(2));
+
+        // A second client joins while the fetch is in flight.
         let (_late, mut late_rx) = state.register_client("t".into());
         state.subscribe(&_late, key.clone());
 
@@ -1750,10 +1759,14 @@ mod tests {
         let (first, _rx) = state.register_client("t".into());
         assert_eq!(state.subscribe(&first, key.clone()), SubscribeOutcome::Fresh);
 
-        // A late joiner parks, and its fetch begins.
+        // A late joiner parks, and its fetch begins. The sleeps separate the
+        // two instants so that "parked before the fetch" is decidable on a
+        // clock of any granularity.
         let (late, mut late_rx) = state.register_client("t".into());
         assert_eq!(state.subscribe(&late, key.clone()), SubscribeOutcome::Joined);
+        std::thread::sleep(Duration::from_millis(2));
         let started = state.begin_fetch(&key).expect("claim");
+        std::thread::sleep(Duration::from_millis(2));
 
         // It fails outright -- no source could answer. Only the clients that
         // fetch was for are given up on.
