@@ -100,7 +100,9 @@ fn take_clients_off(state: &Arc<AppState>, id: usize, why: &'static str) -> usiz
     let keys: HashSet<state::SubKey> = work.into_iter().map(|(key, _)| key).collect();
     tracing::warn!(source = id, clients, subs = keys.len(), "{}", why);
     for key in keys {
-        tokio::spawn(upstream::fetch_snapshot(state.clone(), key));
+        // Rebuilt from somewhere else: the source being taken off is the last
+        // one asked, not the first.
+        tokio::spawn(upstream::fetch_snapshot_avoiding(state.clone(), key, Some(id)));
     }
     clients
 }
@@ -196,6 +198,33 @@ async fn main() -> anyhow::Result<()> {
     // Its own ticker, at one second rather than the five the window above runs
     // at: that one is paced by the silence resolution, and a book minutes stale
     // should not wait on it. The check itself is two atomic loads per source.
+    // The per-subscription watchdog. The two above judge sources as a whole;
+    // a source can go quiet on one single-sourced key while carrying on with
+    // everything else, and then only this notices. See `stalled_leaders`.
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                ticker.tick().await;
+                for (key, leader) in state.stalled_leaders(state::STALL_LIMIT) {
+                    let clients = state.rebuild_off_leader(&key, leader);
+                    if clients == 0 {
+                        continue;
+                    }
+                    tracing::warn!(
+                        source = leader,
+                        sub = %key.label(),
+                        clients,
+                        "leader went quiet on this subscription while another source kept sending it; \
+                         rebuilding from another source"
+                    );
+                    tokio::spawn(upstream::fetch_snapshot_avoiding(state.clone(), key, Some(leader)));
+                }
+            }
+        });
+    }
+
     if lag_blocks.is_some() {
         // One poller per source: a slow or unreachable one must not delay the
         // others' measurements, which is the whole point of asking each source

@@ -164,6 +164,19 @@ Either way the book jumps to the replacement node's version — the jump is real
 but the alternative is not "no jump", it is a book
 quietly spliced together from two different ones.
 
+"Dies" is not only the whole source going quiet or falling behind. A leader can
+stop sending **one** `l2Diff` subscription while carrying on with everything
+else — probe, other coins, a height that keeps rising on `/health` — and then
+neither source-level watchdog fires, while the other node's frames for that very
+key arrive and are dropped. That was caught in production: one snapshot, then a
+minute of nothing. So each subscription also remembers when every source last
+sent anything for it, and once a second the leader is checked against the rest:
+quiet on the key for 5 s while another source kept sending it, three checks
+running, and the clients are rebuilt — from a snapshot asked of the **other**
+sources first, since the one just abandoned may well still rank highest. Quiet
+on a key that nobody is sending is a coin that is not changing, and is left
+alone.
+
 #### Block — positions raced within one stamp
 
 `l4Book` updates and `orderUpdates`: the channels that emit **every** batch which

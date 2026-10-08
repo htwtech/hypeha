@@ -247,13 +247,30 @@ pub fn rank_snapshot_sources(state: &AppState) -> Vec<(usize, String)> {
 /// serves. Measured on a live server the same subscription was asked for 4 165
 /// times in ten minutes, each with its own connection.
 pub async fn fetch_snapshot(state: Arc<AppState>, key: SubKey) {
+    fetch_snapshot_avoiding(state, key, None).await
+}
+
+/// `fetch_snapshot`, asking `avoid` only once every other source has failed.
+///
+/// For a rebuild that exists to move clients *off* a source. The ranking alone
+/// would happily pick it again -- a source quiet on one key can still be the
+/// one with the highest height -- and the snapshot pins the stream to whoever
+/// answered it, so the clients would land straight back where they froze. Last
+/// rather than excluded: if nobody else can answer, a snapshot from it still
+/// beats disconnecting everyone.
+pub async fn fetch_snapshot_avoiding(state: Arc<AppState>, key: SubKey, avoid: Option<usize>) {
     loop {
         // Somebody else is already fetching for this key; whoever we parked
         // will be served by that fetch or by the one it hands over to.
         let Some(started) = state.begin_fetch(&key) else { return };
 
+        let mut ranked = rank_snapshot_sources(&state);
+        if let Some(avoid) = avoid {
+            // Stable, so the others keep their order.
+            ranked.sort_by_key(|(id, _)| *id == avoid);
+        }
         let mut served = false;
-        for (id, url) in rank_snapshot_sources(&state) {
+        for (id, url) in ranked {
             match tokio::time::timeout(SNAPSHOT_TIMEOUT, snapshot_from(&url, &key)).await {
                 Ok(Some((height, payload))) => {
                     state.deliver_snapshot_since(&key, started, id, height, &payload);

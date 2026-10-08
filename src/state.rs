@@ -332,6 +332,40 @@ pub struct SubEntry {
     /// on resuming, out-rank the survivor everyone was rebuilt onto and drag
     /// the clients hundreds of blocks forward with no snapshot in between.
     needs_snapshot: u64,
+    /// When each source last sent anything for this key, by source id -- a
+    /// frame that won, lost or was refused alike. What `stalled_leaders` reads:
+    /// a source can go quiet on one subscription while carrying on everywhere
+    /// else, and nothing measured per source can see that.
+    heard_at: Vec<Option<Instant>>,
+    /// Consecutive watchdog checks that found the leader quiet on this key
+    /// while another source carried it.
+    stall_ticks: u64,
+}
+
+/// Free a subscription from `source_id` and park everyone on it for a rebuild,
+/// returning the parked client ids. The incremental half of a resync, shared by
+/// the per-source watchdogs and the per-key one.
+fn park_off_leader(entry: &mut SubEntry, source_id: usize, now: Instant) -> Vec<u64> {
+    entry.block_leader = None;
+    entry.block_sampled = 0;
+    entry.stall_ticks = 0;
+    // Write the source off until it snapshots again: it stalled while possibly
+    // ahead of everyone else, and resuming its increments would drag the
+    // clients forward past whatever they get rebuilt on.
+    entry.needs_snapshot |= source_bit(source_id);
+    // Let go of its height too. The surviving source may well be behind it —
+    // with a spare deliberately kept on a slower peer, it usually is — and
+    // holding the old height would leave every frame it sends looking stale,
+    // forever. The clients are parked and about to be rebuilt from a snapshot
+    // anyway, so there is no timeline left to protect here.
+    entry.last = 0;
+    let orphaned: Vec<Arc<Client>> = entry.subscribers.drain(..).collect();
+    let mut parked = Vec::with_capacity(orphaned.len());
+    for client in orphaned {
+        parked.push(client.id);
+        entry.pending.push(Pending { client, held: VecDeque::new(), bytes: 0, parked_at: now });
+    }
+    parked
 }
 
 impl Default for SubEntry {
@@ -348,6 +382,8 @@ impl Default for SubEntry {
             block_sent: 0,
             block_seen: Vec::new(),
             needs_snapshot: 0,
+            heard_at: Vec::new(),
+            stall_ticks: 0,
         }
     }
 }
@@ -364,6 +400,21 @@ impl SubEntry {
     /// exactly during a rebuild, which is otherwise invisible from outside.
     pub fn is_rebuilding(&self, client_id: u64) -> bool {
         self.pending.iter().any(|p| p.client.id == client_id)
+    }
+
+    fn note_heard(&mut self, id: usize, now: Instant) {
+        if self.heard_at.len() <= id {
+            self.heard_at.resize(id + 1, None);
+        }
+        self.heard_at[id] = Some(now);
+    }
+
+    fn heard_within(&self, id: usize, now: Instant, limit: Duration) -> bool {
+        self.heard_at
+            .get(id)
+            .copied()
+            .flatten()
+            .is_some_and(|t| now.saturating_duration_since(t) <= limit)
     }
 
     /// Count one more message of the current block from `id`, returning that
@@ -448,6 +499,19 @@ const CLIENT_QUEUE: usize = 65536;
 /// rebuilding them stalled the other reader into being marked in its turn:
 /// 1 -> 0 -> 1, every few minutes, in production.
 const LAG_CONFIRM_TICKS: u64 = 3;
+
+/// How long the leader of a single-sourced subscription may stay quiet on it
+/// while another source keeps sending it, and for how many consecutive checks,
+/// before the subscription is moved off it. See `stalled_leaders`.
+///
+/// Both halves matter. The silence alone cannot tell a stalled leader from a
+/// coin nobody is trading -- hence "while another source keeps sending it".
+/// And on a coin that changes once a minute, a check landing in the few
+/// milliseconds between the other source's frame and the leader's own would
+/// see the leader a minute quiet; the run of checks is what says it really
+/// missed the update rather than being a moment behind with it.
+pub const STALL_LIMIT: Duration = Duration::from_secs(5);
+const STALL_CONFIRM_TICKS: u64 = 3;
 
 impl AppState {
     pub fn new(sources: Vec<Arc<Source>>, max_age: Option<Duration>) -> Self {
@@ -618,6 +682,7 @@ impl AppState {
         // each carries the whole top of book, and the next one supersedes it.
         let incremental = key.is_incremental();
         let mut entry = self.subs.entry(key).or_default();
+        entry.note_heard(src.id, now);
 
         let mut deliver = false;
         let mut win = false;
@@ -1050,27 +1115,78 @@ impl AppState {
                 continue;
             }
             let key = entry.key().clone();
-            entry.block_leader = None;
-            entry.block_sampled = 0;
-            // Write the source off until it snapshots again: it stalled while
-            // possibly ahead of everyone else, and resuming its increments
-            // would drag the clients forward past whatever they get rebuilt on.
-            entry.needs_snapshot |= source_bit(source_id);
-            // Let go of its height too. The surviving source may well be behind
-            // it — with a spare deliberately kept on a slower peer, it usually
-            // is — and holding the old height would leave every frame it sends
-            // looking stale, forever. The clients are parked and about to be
-            // rebuilt from a snapshot anyway, so there is no timeline left to
-            // protect here.
-            entry.last = 0;
-            let orphaned: Vec<Arc<Client>> = entry.subscribers.drain(..).collect();
-            for client in orphaned {
-                tracing::warn!(client = client.id, sub = %key.label(), "block leader lost mid-block, resyncing");
-                work.push((key.clone(), client.id));
-                entry.pending.push(Pending { client, held: VecDeque::new(), bytes: 0, parked_at: now });
+            for client in park_off_leader(&mut entry, source_id, now) {
+                tracing::warn!(client, sub = %key.label(), "block leader lost mid-block, resyncing");
+                work.push((key.clone(), client));
             }
         }
         work
+    }
+
+    /// Single-sourced incremental subscriptions whose leader has gone quiet on
+    /// them while another source keeps sending them: `(key, leader)`.
+    ///
+    /// The hole this closes. Such a subscription follows one source from end to
+    /// end, and the other sources' frames for it are dropped -- an increment
+    /// only applies to the book it was computed from. So it is only ever moved
+    /// when its leader is: silent as a whole (`silent_sources`) or behind
+    /// (`lagging_sources`). A leader that stops sending *this one key* while
+    /// carrying on with everything else -- probe, other coins, a height that
+    /// keeps rising on `/health` -- trips neither, and the clients sit on a
+    /// frozen book for as long as it lasts. That is what `l2Diff` through wsarb
+    /// was caught doing: one snapshot, then a minute of nothing, while the other
+    /// node's frames for the very same key arrived and were thrown away.
+    ///
+    /// Judged per key and relatively: quiet on a key nobody else is sending is a
+    /// coin that is not changing, and is left alone.
+    pub fn stalled_leaders(&self, limit: Duration) -> Vec<(SubKey, usize)> {
+        self.stalled_leaders_at(Instant::now(), limit)
+    }
+
+    fn stalled_leaders_at(&self, now: Instant, limit: Duration) -> Vec<(SubKey, usize)> {
+        let mut out = Vec::new();
+        for mut entry in self.subs.iter_mut() {
+            let leader = self.stalled_leader(entry.key(), &entry, now, limit);
+            match leader {
+                None => entry.stall_ticks = 0,
+                Some(leader) => {
+                    entry.stall_ticks += 1;
+                    if entry.stall_ticks >= STALL_CONFIRM_TICKS {
+                        out.push((entry.key().clone(), leader));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn stalled_leader(&self, key: &SubKey, entry: &SubEntry, now: Instant, limit: Duration) -> Option<usize> {
+        // Only where following one source is the rule. Raced channels move to
+        // whoever is fastest by themselves, and a self-contained one hands the
+        // stream to any source with a newer frame.
+        if !(key.single_sourced() && key.is_incremental()) || entry.subscribers.is_empty() {
+            return None;
+        }
+        let leader = entry.block_leader?;
+        if entry.heard_within(leader, now, limit) {
+            return None;
+        }
+        let carried = self
+            .sources
+            .iter()
+            .any(|s| s.id != leader && s.stats.connected.load(Relaxed) && entry.heard_within(s.id, now, limit));
+        carried.then_some(leader)
+    }
+
+    /// Take one subscription off `source_id` and park its clients for a
+    /// rebuild, returning how many were parked. Zero if the subscription has
+    /// moved on since it was found stalled.
+    pub fn rebuild_off_leader(&self, key: &SubKey, source_id: usize) -> usize {
+        let Some(mut entry) = self.subs.get_mut(key) else { return 0 };
+        if entry.block_leader != Some(source_id) {
+            return 0;
+        }
+        park_off_leader(&mut entry, source_id, Instant::now()).len()
     }
 
     /// Give up on a waiting client. Serving an incremental stream with no
@@ -1213,6 +1329,27 @@ mod tests {
             })
             .collect();
         AppState::new(sources, None)
+    }
+
+    /// Two connected sources, one client on `l2Diff` BTC led by source 0, and
+    /// each source last heard on the key at the given offsets from `t0`.
+    fn stalled_setup(leader_heard: u64, other_heard: u64) -> (AppState, SubKey, Instant) {
+        let state = test_state(2);
+        for s in &state.sources {
+            s.stats.connected.store(true, Relaxed);
+        }
+        let key = SubKey::L2Diff { coin: "BTC".into(), n_sig_figs: None, n_levels: None, mantissa: None };
+        let (client, _rx) = state.register_client("t".into());
+        state.subscribe(&client, key.clone());
+        state.on_update(&state.sources[0].clone(), key.clone(), Seq::Snapshot(10), msg("snap-a"));
+        assert_eq!(state.subs.get(&key).unwrap().leader(), Some(0));
+
+        let t0 = Instant::now();
+        state.subs.get_mut(&key).unwrap().heard_at = vec![
+            Some(t0 + Duration::from_secs(leader_heard)),
+            Some(t0 + Duration::from_secs(other_heard)),
+        ];
+        (state, key, t0)
     }
 
     fn drain(rx: &mut mpsc::Receiver<Utf8Bytes>) -> Vec<String> {
@@ -1516,6 +1653,69 @@ mod tests {
 
     /// Blocks behind before a source counts as lagging, in these tests.
     const LIMIT: u64 = 50;
+
+    #[test]
+    fn a_leader_quiet_on_one_subscription_is_taken_off_it() {
+        // Caught in production: `l2Diff` through wsarb sent one snapshot and
+        // then nothing for a minute, while the other node's frames for the same
+        // key arrived and were dropped. The leader, quiet on this key alone, was
+        // never silent as a source nor behind, so nothing moved it.
+        let (state, key, t0) = stalled_setup(0, 9);
+        let at = t0 + Duration::from_secs(10);
+
+        for tick in 1..STALL_CONFIRM_TICKS {
+            assert!(state.stalled_leaders_at(at, STALL_LIMIT).is_empty(), "acted on tick {tick}");
+        }
+        assert_eq!(state.stalled_leaders_at(at, STALL_LIMIT), vec![(key.clone(), 0)]);
+
+        // Moved off it: the client is parked for a snapshot from elsewhere and
+        // the old leader's increments are refused until it snapshots again.
+        assert_eq!(state.rebuild_off_leader(&key, 0), 1);
+        let e = state.subs.get(&key).unwrap();
+        assert_eq!(e.leader(), None);
+        assert!(e.subscribers.is_empty());
+        assert_eq!(e.pending.len(), 1);
+        assert_ne!(e.needs_snapshot & source_bit(0), 0);
+        assert_eq!(e.stall_ticks, 0);
+    }
+
+    #[test]
+    fn a_subscription_nobody_is_sending_is_not_stalled() {
+        // A coin that is not changing: every source is quiet on it at once, and
+        // there is nothing better to move to.
+        let (state, _key, t0) = stalled_setup(0, 0);
+        let at = t0 + Duration::from_secs(60);
+        for _ in 0..STALL_CONFIRM_TICKS * 3 {
+            assert!(state.stalled_leaders_at(at, STALL_LIMIT).is_empty());
+        }
+    }
+
+    #[test]
+    fn a_leader_a_moment_late_with_an_update_is_not_moved() {
+        // A slow coin: the other source's frame lands a moment before the
+        // leader's. One check in between sees the leader long quiet -- the run
+        // of checks is what keeps that from being a verdict.
+        let (state, key, t0) = stalled_setup(0, 60);
+        let at = t0 + Duration::from_secs(60);
+        assert!(state.stalled_leaders_at(at, STALL_LIMIT).is_empty());
+        assert_eq!(state.subs.get(&key).unwrap().stall_ticks, 1);
+
+        // The leader's own frame arrives: the count starts over.
+        state.subs.get_mut(&key).unwrap().heard_at[0] = Some(at);
+        assert!(state.stalled_leaders_at(at, STALL_LIMIT).is_empty());
+        assert_eq!(state.subs.get(&key).unwrap().stall_ticks, 0);
+    }
+
+    #[test]
+    fn a_stalled_subscription_that_has_moved_on_is_left_alone() {
+        // Found stalled, but by the time the watchdog acts the leader has
+        // changed (another watchdog got there first). Parking it again would
+        // rebuild clients that are already fine.
+        let (state, key, _t0) = stalled_setup(0, 9);
+        state.subs.get_mut(&key).unwrap().block_leader = Some(1);
+        assert_eq!(state.rebuild_off_leader(&key, 0), 0);
+        assert_eq!(state.subs.get(&key).unwrap().subscribers.len(), 1);
+    }
 
     #[test]
     fn a_quiet_market_is_not_mistaken_for_a_lagging_source() {
