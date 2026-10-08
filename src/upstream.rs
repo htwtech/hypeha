@@ -106,6 +106,7 @@ pub async fn run(state: Arc<AppState>, src: Arc<Source>, mut ctrl_rx: mpsc::Unbo
             Ok((ws, _resp)) => {
                 backoff = RECONNECT_MIN;
                 src.stats.connected.store(true, Relaxed);
+                src.stats.reset_stream_height();
                 tracing::info!(source = src.id, url = %src.url, "connected");
 
                 let (mut write, mut read) = ws.split();
@@ -447,6 +448,15 @@ fn handle_text(state: &AppState, src: &Source, text: &str) {
     }
 
     if let Some((key, seq)) = route(frame) {
+        // Where this source's stream stands, in blocks, for the dashboard. Only
+        // off the channels ordered by height: `Sticky` and `Snapshot` also carry
+        // `l2Book`'s block *time*, which is not a height.
+        if key.ordered_by_height() {
+            if let Seq::Block(h) | Seq::Sticky(h) | Seq::Snapshot(h) = seq {
+                src.stats.record_stream_height(h);
+            }
+        }
+
         // Absolute freshness, which the arbitration cannot supply on its own.
         //
         // Ordering is judged relative to what has already been forwarded, but
@@ -765,6 +775,26 @@ mod tests {
 
     fn ids(v: Vec<(usize, String)>) -> Vec<usize> {
         v.into_iter().map(|(id, _)| id).collect()
+    }
+
+    #[test]
+    fn the_stream_height_is_read_off_height_ordered_channels_only() {
+        // `l2Book` shares `Seq::Sticky` with `l2Diff`, but its stamp is a block
+        // time: read as a height it would put the source a trillion blocks
+        // ahead of the network.
+        let state = state_with(1);
+        let src = state.sources[0].clone();
+        let book = r#"{"channel":"l2Book","data":{"coin":"BTC","time":1791489330965,"levels":[[],[]]}}"#;
+        handle_text(&state, &src, book);
+        assert_eq!(src.stats.stream_height(), None);
+
+        let upd = r#"{"channel":"l2Diff","data":{"Updates":{"coin":"BTC","time":2,"height":1176628807,"prevHeight":1176628806,"bids":{"upd":[],"del":[]},"asks":{"upd":[],"del":[]}}}}"#;
+        handle_text(&state, &src, upd);
+        assert_eq!(src.stats.stream_height(), Some(1_176_628_807));
+
+        // A reconnect forgets it, so a node that restarted lower is seen lower.
+        src.stats.reset_stream_height();
+        assert_eq!(src.stats.stream_height(), None);
     }
 
     #[test]

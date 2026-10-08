@@ -128,6 +128,14 @@ impl SubKey {
         matches!(self, Self::L2Diff { .. } | Self::L2Book { .. })
     }
 
+    /// Whether this channel's frames are ordered by block height -- the ones a
+    /// source's height can be read off as they arrive. Every other channel is
+    /// ordered by a block *time* or a trade id, which are not heights even
+    /// where they share a `Seq` variant with one (`l2Book` is `Sticky` by time).
+    pub fn ordered_by_height(&self) -> bool {
+        matches!(self, Self::L2Diff { .. } | Self::L4Book { .. } | Self::OrderUpdates { .. })
+    }
+
     /// Whether the channel streams increments against a prior snapshot, so that
     /// a dropped or out-of-order frame corrupts the client's book for good.
     pub fn is_incremental(&self) -> bool {

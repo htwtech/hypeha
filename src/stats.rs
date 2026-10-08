@@ -76,6 +76,15 @@ pub struct SourceStats {
     /// declared behind — silence is `silent_sources`' business — but the count
     /// belongs on the dashboard.
     health_failures: AtomicU64,
+    /// Highest block height carried by any frame from this source since it
+    /// last connected, as our reader parsed them. Zero means none yet.
+    ///
+    /// The stream's side of the height, next to `health_height` which is the
+    /// node's own word. Display only, for the reason the lag verdict moved off
+    /// frames: a reader of ours held up reads exactly like a node that stopped.
+    /// Which is also what makes the pair worth showing -- the stream behind
+    /// `/health` points at our reader, both behind the network at the node.
+    stream_height: AtomicU64,
     /// Largest `now - block_time` ever seen from this source, in ms. Diagnostic
     /// only: the lag verdict is relative, this is the absolute worst moment.
     peak_age_ms: AtomicU64,
@@ -182,6 +191,24 @@ impl SourceStats {
     /// is judged by `silent_sources`, not here.
     pub fn record_health_failure(&self) {
         self.health_failures.fetch_add(1, Relaxed);
+    }
+
+    /// Highest height seen in this source's frames since it connected.
+    pub fn stream_height(&self) -> Option<u64> {
+        match self.stream_height.load(Relaxed) {
+            0 => None,
+            h => Some(h),
+        }
+    }
+
+    pub fn record_stream_height(&self, height: u64) {
+        self.stream_height.fetch_max(height, Relaxed);
+    }
+
+    /// Forget it on reconnecting: a node that restarted comes back lower than
+    /// it left, and a maximum kept across that would hide exactly that.
+    pub fn reset_stream_height(&self) {
+        self.stream_height.store(0, Relaxed);
     }
 
     /// How old this source's newest data is, against the wall clock. Useful to
@@ -537,7 +564,7 @@ pub fn render_page(state: &crate::state::AppState) -> String {
         let lagging = connected && s.is_lagging();
         cum_rows.push_str(&format!(
             "<tr><td class=nd>{node}</td><td>{url}</td>\
-             <td class={cls}>{state_txt}</td><td>{last_data}</td><td title=\"{peak}\">{age}</td><td class={hcls}>{height}</td><td class={ncls} title=\"{ntitle}\">{vs_net}</td><td>{packets}</td><td>{disc}</td>\
+             <td class={cls}>{state_txt}</td><td>{last_data}</td><td title=\"{peak}\">{age}</td><td class={hcls}>{height}</td><td class={ncls} title=\"{ntitle}\">{vs_net}</td><td class=num title=\"{stitle}\">{sheight}</td><td class={sncls} title=\"{ntitle}\">{s_vs_net}</td><td>{packets}</td><td>{disc}</td>\
              <td class=num>{wins}</td><td class=num>{dups}</td><td class=num>{stale}</td><td class={oldcls}>{old}</td><td>{avg:.1}</td><td class=hist>{hist}</td></tr>",
             node = format!("node{}", src.id + 1),
             url = html_escape(&src.url),
@@ -600,6 +627,23 @@ pub fn render_page(state: &crate::state::AppState) -> String {
                 _ => "num",
             },
             ntitle = net_title,
+            // The same height as read off the frames themselves (l2Diff, l4Book,
+            // orderUpdates) -- what the clients actually receive, through our
+            // reader. Below `height` means our reader is behind the node; both
+            // below the network means the node is.
+            sheight = match s.stream_height() {
+                None => "&mdash;".to_string(),
+                Some(h) => group(h),
+            },
+            stitle = "highest height in this source's frames since it connected, as our reader parsed them",
+            s_vs_net = match (net_height, s.stream_height()) {
+                (Some(n), Some(h)) => fmt_vs_network(n, h),
+                _ => "&mdash;".to_string(),
+            },
+            sncls = match (net_height, s.stream_height()) {
+                (Some(n), Some(h)) if n.saturating_sub(h) > NET_BEHIND_WARN => "over",
+                _ => "num",
+            },
             packets = group(s.packets.load(Relaxed)),
             disc = group(s.disconnects.load(Relaxed)),
             wins = group(s.wins.load(Relaxed)),
@@ -799,7 +843,7 @@ th{background:#1c1c1c}
     out.push_str("<div class='cap c1'>Data connections &mdash; cumulative since start</div>\n");
     out.push_str(&network_line(state, now_ms));
     out.push_str("<table>\n");
-    out.push_str("<tr><th>node</th><th>endpoint</th><th>state</th><th>last data</th><th>data age</th><th>height</th><th>vs network</th><th>packets</th><th>disc</th><th>wins</th><th>dups</th><th>stale</th><th>too old</th><th>avg delay (ms)</th><th>delay histogram</th></tr>\n");
+    out.push_str("<tr><th>node</th><th>endpoint</th><th>state</th><th>last data</th><th>data age</th><th>height</th><th>vs network</th><th>stream height</th><th>stream vs net</th><th>packets</th><th>disc</th><th>wins</th><th>dups</th><th>stale</th><th>too old</th><th>avg delay (ms)</th><th>delay histogram</th></tr>\n");
     out.push_str(&cum_rows);
     out.push_str("</table>\n");
 

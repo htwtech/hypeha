@@ -154,6 +154,17 @@ async fn main() -> anyhow::Result<()> {
     // resubscribe it sends on connecting rather than as a second request.
     if !args.no_probe {
         state.pin(state::SubKey::Bbo { coin: args.probe_coin.clone() });
+        // And its l2Diff, for the height: `bbo` carries only a block time, and
+        // only when the top of book moves, while l2Diff carries the height on
+        // almost every block of an active coin. Without it `stream height` on
+        // the dashboard would depend on what the clients happen to subscribe
+        // to. Default depth, so it costs the nodes next to nothing.
+        state.pin(state::SubKey::L2Diff {
+            coin: args.probe_coin.clone(),
+            n_sig_figs: None,
+            n_levels: None,
+            mantissa: None,
+        });
     }
 
     for (src, ctrl_rx) in state.sources.iter().cloned().zip(receivers) {
