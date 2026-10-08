@@ -163,6 +163,7 @@ class Stream(threading.Thread):
         self.sigs = {}          # time -> signature
         self.frames = self.snapshots = 0
         self.last_t = None      # newest time recorded, for the live readout
+        self.advanced_at = None # wall time `last_t` last moved
         self.error = None
 
     def run(self):
@@ -207,6 +208,8 @@ class Stream(threading.Thread):
         snap = [dict(book[0]), dict(book[1])]
         self.books[t] = snap
         self.sigs[t] = signature(snap)
+        if t != self.last_t:
+            self.advanced_at = _time.time()
         self.last_t = t
 
 
@@ -220,6 +223,8 @@ def main():
     ap.add_argument("--sig-figs", type=int, default=None)
     ap.add_argument("--seconds", type=float, default=60.0)
     ap.add_argument("--token", default=None)
+    ap.add_argument("--stuck", type=float, default=5.0,
+                    help="seconds wsarb may stand still while a node moves on")
     args = ap.parse_args()
 
     def sub(kind):
@@ -242,11 +247,24 @@ def main():
     # Which node wsarb is following, live. Without this the failover test is
     # guesswork: the leader is whoever answered first, so it differs from run to
     # run, and there is no telling which node to stop.
+    # A stream that stops after its snapshot keeps "matching" a node on that one
+    # snapshot for ever: the first version of this printed "following A" for a
+    # full minute over a single frame and then said PASSED. So stillness is
+    # checked on its own, against the nodes moving on.
+    stalls = 0
     while _time.time() < deadline:
         _time.sleep(min(5.0, max(0.1, deadline - _time.time())))
+        elapsed = args.seconds - (deadline - _time.time())
         t = w.last_t
         if t is None:
-            print("  [{:>3.0f}s] wsarb: nothing yet".format(args.seconds - (deadline - _time.time())))
+            print("  [{:>3.0f}s] wsarb: nothing yet".format(elapsed))
+            continue
+        still = _time.time() - w.advanced_at
+        moved = [n for n, s in (("A", a), ("B", b)) if s.last_t is not None and s.last_t > t]
+        if still > args.stuck and moved:
+            stalls += 1
+            print("  [{:>3.0f}s] wsarb {} frames, STUCK: nothing new for {:.0f}s while {} moved on"
+                  .format(elapsed, w.frames, still, "+".join(moved)))
             continue
         # .get on a dict another thread is writing is safe here; iterating it
         # would not be.
@@ -320,8 +338,14 @@ def main():
         print("distinguishable at {} instants, followed {}, switched {} time(s)"
               .format(len(order), "/".join(sorted(set(order))), switches))
 
-    ok = neither == 0 and len(common) > 0
+    after_snapshot = w.frames - w.snapshots
+    ok = neither == 0 and len(common) > 0 and stalls == 0 and after_snapshot > 0
     print("")
+    if after_snapshot <= 0:
+        print("wsarb sent its snapshot(s) and nothing after: the stream is not moving.")
+    elif stalls:
+        print("wsarb stood still for more than {:.0f}s at {} check(s) while a node moved on."
+              .format(args.stuck, stalls))
     print("RESULT: {}".format("PASSED" if ok else "FAILED"))
     if neither:
         print("A book matching neither node is the channel's own fault: it was")
