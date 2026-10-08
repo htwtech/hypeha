@@ -479,6 +479,9 @@ pub struct AppState {
     /// one and the same subscription, each opening its own connection to a node
     /// for the same book.
     fetching: DashMap<SubKey, Instant>,
+    /// The network's own height, from outside our nodes. Shown, never acted
+    /// on -- see `crate::reference`.
+    pub reference: crate::reference::Reference,
 }
 
 /// How many pending messages we buffer per client.
@@ -522,6 +525,7 @@ impl AppState {
             clients: DashMap::new(),
             next_client_id: AtomicU64::new(1),
             fetching: DashMap::new(),
+            reference: Default::default(),
         }
     }
 

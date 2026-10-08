@@ -469,6 +469,46 @@ fn render_race_section(out: &mut String) {
     }
 }
 
+/// Blocks behind the network beyond which `vs network` is shown in red. At ~14
+/// blocks a second, about three and a half seconds; the same as `--lag-blocks`'
+/// default, so the two columns speak the same language.
+const NET_BEHIND_WARN: u64 = 50;
+
+/// `vs network` for one source: blocks behind, or ahead with a `+`. Ahead is
+/// ordinary by a few blocks -- the reference trails the chain too.
+fn fmt_vs_network(network: u64, source: u64) -> String {
+    if network >= source {
+        group(network - source)
+    } else {
+        format!("+{}", group(source - network))
+    }
+}
+
+/// One line above the source table: where the network's height comes from and
+/// whether it is alive, so an empty `vs network` column explains itself.
+fn network_line(state: &crate::state::AppState, now_ms: u64) -> String {
+    let r = &state.reference;
+    let Some(url) = r.url() else {
+        return "<div class=sum style='margin:-.2em 0 .5em;font-size:11px'>network reference: off</div>\n".to_string();
+    };
+    let body = match (r.height(), r.age(now_ms)) {
+        (Some(h), Some(a)) if a <= crate::reference::STALE_AFTER => {
+            format!("network height <b>{}</b>, last block {:.1}s ago", group(h), a.as_secs_f64())
+        }
+        (Some(h), Some(a)) => format!(
+            "<span class=over>network height {} is {:.0}s old &mdash; not measuring by it</span>",
+            group(h),
+            a.as_secs_f64()
+        ),
+        _ if r.is_connected() => "network reference connected, no block yet".to_string(),
+        _ => "<span class=over>network reference not connected</span>".to_string(),
+    };
+    format!(
+        "<div class=sum style='margin:-.2em 0 .5em;font-size:11px'>{body} &mdash; via {} explorerBlock</div>\n",
+        html_escape(url)
+    )
+}
+
 /// Render the HTML stats page from a snapshot of the shared state.
 pub fn render_page(state: &crate::state::AppState) -> String {
     // Read once for the whole page, so the ages in a row are all measured from
@@ -476,6 +516,11 @@ pub fn render_page(state: &crate::state::AppState) -> String {
     let now_ms = crate::upstream::unix_ms();
 
     // ---- Table 1: cumulative ----
+    let net_height = state.reference.current(now_ms);
+    let net_title = match (state.reference.height(), state.reference.age(now_ms)) {
+        (Some(h), Some(a)) => format!("network height {} as of {:.1}s ago", group(h), a.as_secs_f64()),
+        _ => "no network height".to_string(),
+    };
     let mut cum_rows = String::new();
     for src in &state.sources {
         let s = &src.stats;
@@ -492,7 +537,7 @@ pub fn render_page(state: &crate::state::AppState) -> String {
         let lagging = connected && s.is_lagging();
         cum_rows.push_str(&format!(
             "<tr><td class=nd>{node}</td><td>{url}</td>\
-             <td class={cls}>{state_txt}</td><td>{last_data}</td><td title=\"{peak}\">{age}</td><td class={hcls}>{height}</td><td>{packets}</td><td>{disc}</td>\
+             <td class={cls}>{state_txt}</td><td>{last_data}</td><td title=\"{peak}\">{age}</td><td class={hcls}>{height}</td><td class={ncls} title=\"{ntitle}\">{vs_net}</td><td>{packets}</td><td>{disc}</td>\
              <td class=num>{wins}</td><td class=num>{dups}</td><td class=num>{stale}</td><td class={oldcls}>{old}</td><td>{avg:.1}</td><td class=hist>{hist}</td></tr>",
             node = format!("node{}", src.id + 1),
             url = html_escape(&src.url),
@@ -542,6 +587,19 @@ pub fn render_page(state: &crate::state::AppState) -> String {
                 Some(h) => group(h),
             },
             hcls = if s.health_height().is_some() && !s.health_ready() { "over" } else { "num" },
+            // Blocks behind the network itself, from outside our nodes: the one
+            // column that shows every source falling behind together. A few
+            // blocks either way is sampling, not lag -- the source's height is
+            // polled twice a second, the network's arrives with every block.
+            vs_net = match (net_height, s.health_height()) {
+                (Some(n), Some(h)) => fmt_vs_network(n, h),
+                _ => "&mdash;".to_string(),
+            },
+            ncls = match (net_height, s.health_height()) {
+                (Some(n), Some(h)) if n.saturating_sub(h) > NET_BEHIND_WARN => "over",
+                _ => "num",
+            },
+            ntitle = net_title,
             packets = group(s.packets.load(Relaxed)),
             disc = group(s.disconnects.load(Relaxed)),
             wins = group(s.wins.load(Relaxed)),
@@ -738,8 +796,10 @@ th{background:#1c1c1c}
         coinlist = if coins.is_empty() { "&mdash;".to_string() } else { html_escape(&coins.join(", ")) },
     ));
 
-    out.push_str("<div class='cap c1'>Data connections &mdash; cumulative since start</div>\n<table>\n");
-    out.push_str("<tr><th>node</th><th>endpoint</th><th>state</th><th>last data</th><th>data age</th><th>height</th><th>packets</th><th>disc</th><th>wins</th><th>dups</th><th>stale</th><th>too old</th><th>avg delay (ms)</th><th>delay histogram</th></tr>\n");
+    out.push_str("<div class='cap c1'>Data connections &mdash; cumulative since start</div>\n");
+    out.push_str(&network_line(state, now_ms));
+    out.push_str("<table>\n");
+    out.push_str("<tr><th>node</th><th>endpoint</th><th>state</th><th>last data</th><th>data age</th><th>height</th><th>vs network</th><th>packets</th><th>disc</th><th>wins</th><th>dups</th><th>stale</th><th>too old</th><th>avg delay (ms)</th><th>delay histogram</th></tr>\n");
     out.push_str(&cum_rows);
     out.push_str("</table>\n");
 

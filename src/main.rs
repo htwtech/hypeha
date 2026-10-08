@@ -1,6 +1,6 @@
 //! WSARB — websocket arbitration proxy for `order_book_server` feeds.
 
-use wsarb::{client, health, state, stats, upstream};
+use wsarb::{client, health, reference, state, stats, upstream};
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -61,6 +61,17 @@ struct Args {
     /// within a block or two of each other.
     #[arg(long = "lag-blocks", default_value_t = 50)]
     lag_blocks: u64,
+    /// Where to read the network's own height, for the dashboard's `vs network`
+    /// column: the public explorer's `explorerBlock` subscription.
+    ///
+    /// The one measure none of our nodes has a hand in, so it shows them all
+    /// falling behind together -- which comparing them with one another cannot.
+    /// Display only: nothing is moved on it.
+    #[arg(long = "reference", default_value = reference::DEFAULT_URL)]
+    reference: String,
+    /// Do not connect to the network reference at all.
+    #[arg(long = "no-reference")]
+    no_reference: bool,
 }
 
 /// Windows of silence before the connection is bounced once, and how often to
@@ -198,6 +209,12 @@ async fn main() -> anyhow::Result<()> {
     // Its own ticker, at one second rather than the five the window above runs
     // at: that one is paced by the silence resolution, and a book minutes stale
     // should not wait on it. The check itself is two atomic loads per source.
+    if args.no_reference {
+        tracing::info!("network reference disabled");
+    } else {
+        tokio::spawn(reference::run(state.clone(), args.reference.clone()));
+    }
+
     // The per-subscription watchdog. The two above judge sources as a whole;
     // a source can go quiet on one single-sourced key while carrying on with
     // everything else, and then only this notices. See `stalled_leaders`.

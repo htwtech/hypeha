@@ -281,6 +281,7 @@ cargo run --release -- \
 - `--probe-coin <COIN>` — coin for the permanent `bbo` probe (default `BTC`).
 - `--no-probe` — drop the probe entirely.
 - `--max-age <SECS>` — refuse frames whose block time is older than this (default 60; 0 disables).
+- `--reference <URL>` — where to read the network's own height for the dashboard's `vs network` column (default `wss://rpc.hyperliquid.xyz/ws`, the public explorer's `explorerBlock` subscription — not part of the documented API, so it may change). Display only; nothing is moved on it. `--no-reference` turns it off. The column needs the source heights too, which are polled only while `--lag-blocks` is on.
 - `--lag-blocks <N>` — move clients off a source whose book has fallen this many blocks behind the furthest-ahead source (default 50, about 3.5s; 0 disables). Read from each source's own `GET /health`.
 
 ### Refusing data from the past
