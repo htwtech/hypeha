@@ -85,6 +85,10 @@ pub struct SourceStats {
     /// Which is also what makes the pair worth showing -- the stream behind
     /// `/health` points at our reader, both behind the network at the node.
     stream_height: AtomicU64,
+    /// The node's own height, from its `visor_abci_state.json` (`--node-state`).
+    /// Zero means not configured or never read. The latest reading rather than
+    /// a maximum: a node that restarts comes back lower, and that should show.
+    node_height: AtomicU64,
     /// Largest `now - block_time` ever seen from this source, in ms. Diagnostic
     /// only: the lag verdict is relative, this is the absolute worst moment.
     peak_age_ms: AtomicU64,
@@ -191,6 +195,18 @@ impl SourceStats {
     /// is judged by `silent_sources`, not here.
     pub fn record_health_failure(&self) {
         self.health_failures.fetch_add(1, Relaxed);
+    }
+
+    /// The node's own height, as last read from its state file.
+    pub fn node_height(&self) -> Option<u64> {
+        match self.node_height.load(Relaxed) {
+            0 => None,
+            h => Some(h),
+        }
+    }
+
+    pub fn record_node_height(&self, height: u64) {
+        self.node_height.store(height, Relaxed);
     }
 
     /// Highest height seen in this source's frames since it connected.
@@ -496,12 +512,12 @@ fn render_race_section(out: &mut String) {
     }
 }
 
-/// Blocks behind the network beyond which `vs network` is shown in red. At ~14
+/// Blocks behind the network beyond which a `… vs net` column is shown in red. At ~14
 /// blocks a second, about three and a half seconds; the same as `--lag-blocks`'
 /// default, so the two columns speak the same language.
 const NET_BEHIND_WARN: u64 = 50;
 
-/// `vs network` for one source: blocks behind, or ahead with a `+`. Ahead is
+/// One `… vs net` cell: blocks behind, or ahead with a `+`. Ahead is
 /// ordinary by a few blocks -- the reference trails the chain too.
 fn fmt_vs_network(network: u64, source: u64) -> String {
     if network >= source {
@@ -512,7 +528,7 @@ fn fmt_vs_network(network: u64, source: u64) -> String {
 }
 
 /// One line above the source table: where the network's height comes from and
-/// whether it is alive, so an empty `vs network` column explains itself.
+/// whether it is alive, so empty `… vs net` columns explain themselves.
 fn network_line(state: &crate::state::AppState, now_ms: u64) -> String {
     let r = &state.reference;
     let Some(url) = r.url() else {
@@ -564,7 +580,7 @@ pub fn render_page(state: &crate::state::AppState) -> String {
         let lagging = connected && s.is_lagging();
         cum_rows.push_str(&format!(
             "<tr><td class=nd>{node}</td><td>{url}</td>\
-             <td class={cls}>{state_txt}</td><td>{last_data}</td><td title=\"{peak}\">{age}</td><td class={hcls}>{height}</td><td class={ncls} title=\"{ntitle}\">{vs_net}</td><td class=num title=\"{stitle}\">{sheight}</td><td class={sncls} title=\"{ntitle}\">{s_vs_net}</td><td>{packets}</td><td>{disc}</td>\
+             <td class={cls}>{state_txt}</td><td>{last_data}</td><td title=\"{peak}\">{age}</td><td class=num title=\"{nodetitle}\">{nheight}</td><td class={nodecls} title=\"{ntitle}\">{node_vs_net}</td><td class={hcls}>{height}</td><td class={ncls} title=\"{ntitle}\">{vs_net}</td><td class=num title=\"{stitle}\">{sheight}</td><td class={sncls} title=\"{ntitle}\">{s_vs_net}</td><td>{packets}</td><td>{disc}</td>\
              <td class=num>{wins}</td><td class=num>{dups}</td><td class=num>{stale}</td><td class={oldcls}>{old}</td><td>{avg:.1}</td><td class=hist>{hist}</td></tr>",
             node = format!("node{}", src.id + 1),
             url = html_escape(&src.url),
@@ -627,6 +643,24 @@ pub fn render_page(state: &crate::state::AppState) -> String {
                 _ => "num",
             },
             ntitle = net_title,
+            // The node underneath, from its own state file: where the chain is
+            // on this machine. Book behind node is `order_book_server` catching
+            // up -- after a restart it replays minutes of history -- while the
+            // node is fine. The file trails the node's real head a little, so a
+            // few dozen blocks here are normal.
+            nheight = match s.node_height() {
+                None => "&mdash;".to_string(),
+                Some(h) => group(h),
+            },
+            nodetitle = "the node's own height, from its visor_abci_state.json (--node-state)",
+            node_vs_net = match (net_height, s.node_height()) {
+                (Some(n), Some(h)) => fmt_vs_network(n, h),
+                _ => "&mdash;".to_string(),
+            },
+            nodecls = match (net_height, s.node_height()) {
+                (Some(n), Some(h)) if n.saturating_sub(h) > NET_BEHIND_WARN => "over",
+                _ => "num",
+            },
             // The same height as read off the frames themselves (l2Diff, l4Book,
             // orderUpdates) -- what the clients actually receive, through our
             // reader. Below `height` means our reader is behind the node; both
@@ -843,7 +877,7 @@ th{background:#1c1c1c}
     out.push_str("<div class='cap c1'>Data connections &mdash; cumulative since start</div>\n");
     out.push_str(&network_line(state, now_ms));
     out.push_str("<table>\n");
-    out.push_str("<tr><th>node</th><th>endpoint</th><th>state</th><th>last data</th><th>data age</th><th>height</th><th>vs network</th><th>stream height</th><th>stream vs net</th><th>packets</th><th>disc</th><th>wins</th><th>dups</th><th>stale</th><th>too old</th><th>avg delay (ms)</th><th>delay histogram</th></tr>\n");
+    out.push_str("<tr><th>node</th><th>endpoint</th><th>state</th><th>last data</th><th>data age</th><th>node height</th><th>node vs net</th><th>book height</th><th>book vs net</th><th>stream height</th><th>stream vs net</th><th>packets</th><th>disc</th><th>wins</th><th>dups</th><th>stale</th><th>too old</th><th>avg delay (ms)</th><th>delay histogram</th></tr>\n");
     out.push_str(&cum_rows);
     out.push_str("</table>\n");
 
