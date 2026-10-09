@@ -1,6 +1,6 @@
 //! WSARB — websocket arbitration proxy for `order_book_server` feeds.
 
-use wsarb::{client, health, reference, state, stats, upstream};
+use wsarb::{client, health, node, reference, state, stats, upstream};
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -72,15 +72,17 @@ struct Args {
     /// Do not connect to the network reference at all.
     #[arg(long = "no-reference")]
     no_reference: bool,
-    /// Each source's node state file (`…/hyperliquid_data/visor_abci_state.json`),
-    /// in the same order as `--source`, for the dashboard's `node height`.
+    /// Each source's node data directory (the one holding
+    /// `node_fills_streaming/`), in the same order as `--source`, for the
+    /// dashboard's `node height`.
     ///
     /// The node's own height, as opposed to the book height `order_book_server`
     /// reports on `/health`: the two differ exactly while the server catches up
-    /// after a restart. Needs wsarb on the same machine as the nodes. Display
-    /// only.
-    #[arg(long = "node-state", num_args = 1..)]
-    node_states: Vec<String>,
+    /// after a restart. Read off the stream files the node writes every block,
+    /// not `visor_abci_state.json`, which moves in steps of ~70 blocks. Needs
+    /// wsarb on the same machine as the nodes. Display only.
+    #[arg(long = "node-data", num_args = 1..)]
+    node_data: Vec<String>,
 }
 
 /// Windows of silence before the connection is bounced once, and how often to
@@ -135,10 +137,10 @@ async fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
 
-    if !args.node_states.is_empty() && args.node_states.len() != args.sources.len() {
+    if !args.node_data.is_empty() && args.node_data.len() != args.sources.len() {
         anyhow::bail!(
-            "--node-state takes one path per --source, in the same order: got {} for {} sources",
-            args.node_states.len(),
+            "--node-data takes one directory per --source, in the same order: got {} for {} sources",
+            args.node_data.len(),
             args.sources.len()
         );
     }
@@ -231,35 +233,28 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    // Background task: notice a source that keeps talking while its data falls
-    // behind the others'.
-    //
-    // Its own ticker, at one second rather than the five the window above runs
-    // at: that one is paced by the silence resolution, and a book minutes stale
-    // should not wait on it. The check itself is two atomic loads per source.
-    // The node's own height, straight off its state file. One reader per
-    // source, so a file that has gone unreadable on one machine path does not
-    // hold up the other.
-    for (src, path) in state.sources.iter().cloned().zip(args.node_states.iter().cloned()) {
-        tracing::info!(source = src.id, %path, "reading the node's height from its state file");
+    // The node's own height, off the stream files it writes every block (see
+    // `node`). One reader per source, so a data directory that has gone
+    // unreadable does not hold up the other.
+    for (src, dir) in state.sources.iter().cloned().zip(args.node_data.iter().cloned()) {
+        tracing::info!(source = src.id, %dir, "reading the node's height from its stream files");
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(HEALTH_POLL_EVERY);
             let mut failing = false;
             loop {
                 ticker.tick().await;
-                match health::read_node_height(&path).await {
+                match node::read_node_height(dir.clone()).await {
                     Some(h) => {
                         src.stats.record_node_height(h);
                         if failing {
                             failing = false;
-                            tracing::info!(source = src.id, %path, "node state file readable again");
+                            tracing::info!(source = src.id, %dir, "node stream files readable again");
                         }
                     }
-                    // Once per outage, not twice a second. A read that lands
-                    // mid-write fails too, and costs only that one reading.
+                    // Once per outage, not twice a second.
                     None if !failing => {
                         failing = true;
-                        tracing::warn!(source = src.id, %path, "cannot read the node's height from its state file");
+                        tracing::warn!(source = src.id, %dir, "cannot read the node's height from its stream files");
                     }
                     None => {}
                 }
@@ -330,6 +325,12 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Background task: notice a source that keeps talking while its data falls
+    // behind the others'.
+    //
+    // Its own ticker, at one second rather than the five the window above runs
+    // at: that one is paced by the silence resolution, and a book minutes stale
+    // should not wait on it. The check itself is two atomic loads per source.
     if let Some(limit) = lag_blocks {
         let state = state.clone();
         tokio::spawn(async move {

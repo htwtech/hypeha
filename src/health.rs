@@ -34,34 +34,6 @@ use serde::Deserialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-/// The node's own height, read straight off the file it keeps it in.
-///
-/// `/health` answers for `order_book_server` -- the height its *book* has been
-/// applied to. The node underneath writes where *it* is to
-/// `hyperliquid_data/visor_abci_state.json`, block by block:
-///
-/// ```text
-/// {"hardfork_version":107,"initial_height":1170042000,"height":1177653182,
-///  "scheduled_freeze_height":null,"consensus_time":"…","wall_clock_time":"…"}
-/// ```
-///
-/// The two part company exactly when it matters: after `order_book_server`
-/// restarts it replays from a persisted state up to 10 000 blocks old, and for
-/// that while its book is minutes behind a node that is perfectly current.
-/// Reading the file needs wsarb on the same machine as the node, which it is;
-/// it also keeps working while `order_book_server` is down.
-pub async fn read_node_height(path: &str) -> Option<u64> {
-    parse_node_state(&tokio::fs::read_to_string(path).await.ok()?)
-}
-
-fn parse_node_state(text: &str) -> Option<u64> {
-    #[derive(Deserialize)]
-    struct Visor {
-        height: u64,
-    }
-    serde_json::from_str::<Visor>(text).ok().map(|v| v.height)
-}
-
 /// What the server says about itself.
 #[derive(Debug, Deserialize, PartialEq, Eq)]
 pub struct Health {
@@ -138,23 +110,6 @@ fn parse_response(bytes: &[u8]) -> Option<Health> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn the_node_height_is_read_off_its_state_file() {
-        // As found on the user's server, 2026-10-09.
-        let visor = r#"{
-  "hardfork_version": 107,
-  "initial_height": 1170042000,
-  "height": 1177653182,
-  "scheduled_freeze_height": null,
-  "consensus_time": "2026-10-09T16:19:52.912845316",
-  "wall_clock_time": "2026-10-09T16:19:53.125472659"
-}"#;
-        assert_eq!(parse_node_state(visor), Some(1_177_653_182));
-        // Caught mid-write, or not the file we think: no reading, not zero.
-        assert_eq!(parse_node_state(r#"{"hardfork_version": 107, "init"#), None);
-        assert_eq!(parse_node_state(""), None);
-    }
 
     #[test]
     fn the_health_url_is_the_websocket_one_with_another_scheme_and_path() {

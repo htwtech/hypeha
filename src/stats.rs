@@ -85,7 +85,8 @@ pub struct SourceStats {
     /// Which is also what makes the pair worth showing -- the stream behind
     /// `/health` points at our reader, both behind the network at the node.
     stream_height: AtomicU64,
-    /// The node's own height, from its `visor_abci_state.json` (`--node-state`).
+    /// The node's own height, off the stream files it writes every block
+    /// (`--node-data`, see `crate::node`).
     /// Zero means not configured or never read. The latest reading rather than
     /// a maximum: a node that restarts comes back lower, and that should show.
     node_height: AtomicU64,
@@ -643,16 +644,15 @@ pub fn render_page(state: &crate::state::AppState) -> String {
                 _ => "num",
             },
             ntitle = net_title,
-            // The node underneath, from its own state file: where the chain is
-            // on this machine. Book behind node is `order_book_server` catching
-            // up -- after a restart it replays minutes of history -- while the
-            // node is fine. The file trails the node's real head a little, so a
-            // few dozen blocks here are normal.
+            // The node underneath, off the stream files it writes every block:
+            // where the chain is on this machine. Book behind node is
+            // `order_book_server` catching up -- after a restart it replays
+            // minutes of history -- while the node is fine.
             nheight = match s.node_height() {
                 None => "&mdash;".to_string(),
                 Some(h) => group(h),
             },
-            nodetitle = "the node's own height, from its visor_abci_state.json (--node-state)",
+            nodetitle = "the node's own height: last block in its node_fills_streaming files (--node-data)",
             node_vs_net = match (net_height, s.node_height()) {
                 (Some(n), Some(h)) => fmt_vs_network(n, h),
                 _ => "&mdash;".to_string(),

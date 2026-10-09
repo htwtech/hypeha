@@ -6,6 +6,7 @@
 
 pub mod client;
 pub mod health;
+pub mod node;
 pub mod reference;
 pub mod state;
 pub mod stats;
