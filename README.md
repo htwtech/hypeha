@@ -164,6 +164,16 @@ Either way the book jumps to the replacement node's version — the jump is real
 but the alternative is not "no jump", it is a book
 quietly spliced together from two different ones.
 
+A rebuilt or late-joining `l2Diff` client gets its snapshot from a connection
+opened for it, and its updates from ours. The server keeps `prevHeight` per
+connection, so the first update after the snapshot can name a height below the
+snapshot's: ours had no frame since then. Nothing was missed — no frame means
+nothing changed at that depth — but a client checking the chain, as the
+server's documentation tells it to, would resubscribe, and on a quiet coin
+keep doing so. That first update's `prevHeight` is therefore rewritten to the
+snapshot's height, for that client only. One above the snapshot's height is a
+real gap and is passed on as it is.
+
 "Dies" is not only the whole source going quiet or falling behind. A leader can
 stop sending **one** `l2Diff` subscription while carrying on with everything
 else — probe, other coins, a height that keeps rising on `/health` — and then

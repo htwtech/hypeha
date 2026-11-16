@@ -348,6 +348,44 @@ pub struct SubEntry {
     /// Consecutive watchdog checks that found the leader quiet on this key
     /// while another source carried it.
     stall_ticks: u64,
+    /// `l2Diff` clients just brought up to a snapshot with nothing held behind
+    /// it: (client id, the snapshot's height). Their next frame is chained to
+    /// that height; see [`chained_to`].
+    chain_fix: Vec<(u64, u64)>,
+}
+
+/// An `l2Diff` update re-chained to a snapshot the client got elsewhere.
+///
+/// The server keeps `prevHeight` per connection: the height of the last frame
+/// it sent on that connection. A late joiner's snapshot comes from a
+/// connection of its own, opened for it, at whatever height the book was at;
+/// its updates come from ours, whose chain may not have had a frame since some
+/// height below that. The first update then names a `prevHeight` lower than the
+/// snapshot's height, and a client that checks the chain -- as the server's own
+/// documentation tells it to -- takes that for a missed frame and resubscribes,
+/// over and over on a quiet coin (caught live: `l2Diff:MERL` resubscribed every
+/// 0.3-0.6 s by one connection, with books that matched `l2Book` throughout).
+///
+/// Nothing was missed: our connection got no frame between that height and
+/// the snapshot's, so nothing changed at the subscription's depth in between,
+/// and the update applies to the snapshot as it is. Only the label is off, so
+/// the label is what is changed -- for that client, in its first update only.
+/// A `prevHeight` at the snapshot's height needs nothing; one above it is a
+/// real gap and is left for the client to see. None when nothing changes.
+fn chained_to(payload: &Utf8Bytes, snapshot_height: u64) -> Option<Utf8Bytes> {
+    const KEY: &str = "\"prevHeight\":";
+    let text = payload.as_str();
+    let start = text.find(KEY)? + KEY.len();
+    let len = text[start..].find(|c: char| !c.is_ascii_digit()).unwrap_or(text.len() - start);
+    let prev: u64 = text[start..start + len].parse().ok()?;
+    if prev >= snapshot_height {
+        return None;
+    }
+    let mut out = String::with_capacity(text.len() + 8);
+    out.push_str(&text[..start]);
+    out.push_str(&snapshot_height.to_string());
+    out.push_str(&text[start + len..]);
+    Some(Utf8Bytes::from(out))
 }
 
 /// Free a subscription from `source_id` and park everyone on it for a rebuild,
@@ -367,6 +405,7 @@ fn park_off_leader(entry: &mut SubEntry, source_id: usize, now: Instant) -> Vec<
     // forever. The clients are parked and about to be rebuilt from a snapshot
     // anyway, so there is no timeline left to protect here.
     entry.last = 0;
+    entry.chain_fix.clear();
     let orphaned: Vec<Arc<Client>> = entry.subscribers.drain(..).collect();
     let mut parked = Vec::with_capacity(orphaned.len());
     for client in orphaned {
@@ -392,6 +431,7 @@ impl Default for SubEntry {
             needs_snapshot: 0,
             heard_at: Vec::new(),
             stall_ticks: 0,
+            chain_fix: Vec::new(),
         }
     }
 }
@@ -659,6 +699,7 @@ impl AppState {
         if let Some(mut entry) = self.subs.get_mut(key) {
             entry.subscribers.retain(|c| c.id != client.id);
             entry.pending.retain(|p| p.client.id != client.id);
+            entry.chain_fix.retain(|(id, _)| *id != client.id);
             if entry.subscribers.is_empty()
                 && entry.pending.is_empty()
                 && entry.upstream_subscribed
@@ -875,8 +916,11 @@ impl AppState {
         }
 
         // Clone the (cheap) Arc handles so we can release the shard lock before
-        // touching per-client channels.
+        // touching per-client channels. Pending chain fixes go with the first
+        // frame delivered after them: an update is chained, a snapshot needs
+        // nothing (see `chained_to`).
         let subscribers = if deliver { Some(entry.subscribers.clone()) } else { None };
+        let fixes = if deliver && !entry.chain_fix.is_empty() { std::mem::take(&mut entry.chain_fix) } else { Vec::new() };
         drop(entry);
 
         if win {
@@ -896,9 +940,13 @@ impl AppState {
 
         if let Some(subscribers) = subscribers {
             for client in subscribers {
+                let frame = match fixes.iter().find(|(id, _)| *id == client.id) {
+                    Some(&(_, height)) => chained_to(&payload, height).unwrap_or_else(|| payload.clone()),
+                    None => payload.clone(),
+                };
                 if incremental {
-                    client.send_or_hang_up(payload.clone());
-                } else if client.tx.try_send(payload.clone()).is_err() {
+                    client.send_or_hang_up(frame);
+                } else if client.tx.try_send(frame).is_err() {
                     client.dropped.fetch_add(1, Relaxed);
                 }
             }
@@ -959,6 +1007,8 @@ impl AppState {
             // not apply to this one. Elsewhere every source's frames are
             // equally valid, which is the point of racing them.
             let single = key.single_sourced();
+            // `l2Diff` chains its frames by height; see `chained_to`.
+            let chains = matches!(key, SubKey::L2Diff { .. });
             // Walk from the back so removing does not shift what is still to
             // be looked at.
             for idx in (0..entry.pending.len()).rev() {
@@ -967,11 +1017,18 @@ impl AppState {
                 }
                 let Pending { client, held, .. } = entry.pending.remove(idx);
                 let mut backlog = vec![snapshot.clone()];
-                backlog.extend(
-                    held.into_iter()
-                        .filter(|(sid, h, _)| *h > height && (!single || *sid == source))
-                        .map(|(_, _, b)| b),
-                );
+                let mut behind = held
+                    .into_iter()
+                    .filter(|(sid, h, _)| *h > height && (!single || *sid == source))
+                    .map(|(_, _, b)| b);
+                if chains {
+                    entry.chain_fix.retain(|(id, _)| *id != client.id);
+                    match behind.next() {
+                        Some(first) => backlog.push(chained_to(&first, height).unwrap_or(first)),
+                        None => entry.chain_fix.push((client.id, height)),
+                    }
+                }
+                backlog.extend(behind);
                 entry.subscribers.push(client.clone());
                 ready.push((client, backlog));
             }
@@ -1616,6 +1673,63 @@ mod tests {
 
         // ...and the client that was there first saw an unbroken stream.
         assert_eq!(drain(&mut first_rx), vec!["b10", "b11", "b12"]);
+    }
+
+    fn upd(height: u64, prev: u64) -> String {
+        format!(r#"{{"channel":"l2Diff","data":{{"Updates":{{"coin":"MERL","height":{height},"prevHeight":{prev},"nLevels":1000}}}}}}"#)
+    }
+
+    /// One client on `l2Diff` MERL since its snapshot at 100, and a late joiner
+    /// parked behind it.
+    fn late_l2diff_joiner() -> (AppState, SubKey, Arc<Client>, mpsc::Receiver<Utf8Bytes>, mpsc::Receiver<Utf8Bytes>) {
+        let state = test_state(1);
+        let key = SubKey::L2Diff { coin: "MERL".into(), n_sig_figs: None, n_levels: Some(1000), mantissa: None };
+        let a = state.sources[0].clone();
+        let (first, mut first_rx) = state.register_client("first".into());
+        state.subscribe(&first, key.clone());
+        state.on_update(&a, key.clone(), Seq::Snapshot(100), msg("snap@100"));
+        drain(&mut first_rx);
+        let (late, late_rx) = state.register_client("late".into());
+        assert_eq!(state.subscribe(&late, key.clone()), SubscribeOutcome::Joined);
+        (state, key, late, late_rx, first_rx)
+    }
+
+    #[test]
+    fn a_late_joiners_l2diff_chain_continues_from_its_own_snapshot() {
+        let (state, key, late, mut late_rx, mut first_rx) = late_l2diff_joiner();
+        let a = state.sources[0].clone();
+        // Its snapshot, fetched on a connection of its own, is at 130; our
+        // connection's chain has had nothing since 100.
+        state.deliver_snapshot(&key, late.id, a.id, 130, msg("snap@130"));
+        state.on_update(&a, key.clone(), Seq::Sticky(150), msg(&upd(150, 100)));
+        assert_eq!(drain(&mut late_rx), vec!["snap@130".to_string(), upd(150, 130)]);
+        assert_eq!(drain(&mut first_rx), vec![upd(150, 100)], "everyone else gets the frame as it came");
+
+        // Only the first frame: from there the chain is the stream's own.
+        state.on_update(&a, key.clone(), Seq::Sticky(160), msg(&upd(160, 150)));
+        assert_eq!(drain(&mut late_rx), vec![upd(160, 150)]);
+    }
+
+    #[test]
+    fn a_frame_held_behind_a_snapshot_is_chained_to_it() {
+        let (state, key, late, mut late_rx, _first_rx) = late_l2diff_joiner();
+        let a = state.sources[0].clone();
+        state.on_update(&a, key.clone(), Seq::Sticky(150), msg(&upd(150, 100)));
+        state.deliver_snapshot(&key, late.id, a.id, 130, msg("snap@130"));
+        assert_eq!(drain(&mut late_rx), vec!["snap@130".to_string(), upd(150, 130)]);
+
+        // The fix was spent on the held frame; the next goes as it came.
+        state.on_update(&a, key.clone(), Seq::Sticky(160), msg(&upd(160, 150)));
+        assert_eq!(drain(&mut late_rx), vec![upd(160, 150)]);
+    }
+
+    #[test]
+    fn only_a_prev_height_below_the_snapshot_is_rewritten() {
+        let chained = |prev: u64| chained_to(&msg(&upd(150, prev)), 130).map(|m| m.as_str().to_string());
+        assert_eq!(chained(100), Some(upd(150, 130)));
+        assert_eq!(chained(130), None, "already chained");
+        assert_eq!(chained(140), None, "a real gap is left for the client to see");
+        assert!(chained_to(&msg("snap@130"), 130).is_none(), "a snapshot has no chain to fix");
     }
 
     #[test]
