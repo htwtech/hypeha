@@ -388,6 +388,28 @@ fn chained_to(payload: &Utf8Bytes, snapshot_height: u64) -> Option<Utf8Bytes> {
     Some(Utf8Bytes::from(out))
 }
 
+/// Whether a frame stamped `seq` is older than the `l2Diff` snapshot, taken at
+/// `snapshot_height`, that a client was just brought up to.
+///
+/// The snapshot came from a connection of its own, and ours can be behind it:
+/// it carries every client's subscriptions, and under load its queue. So
+/// frames below the snapshot can still be on their way when the client is
+/// attached. Their changes are in the snapshot already, and a diff carries
+/// absolute sizes, so applying one puts older sizes over newer ones -- a wrong
+/// book, and a silent one once [`chained_to`] has relabelled the frame. (Before
+/// the relabelling the client at least saw the gap and resubscribed.) Such a
+/// frame is not sent to that client, and its chain fix waits for the next.
+///
+/// Only strictly below. One block is flushed more than once, so a frame at the
+/// snapshot's own height may be the flush after it, which the client needs, or
+/// the very flush it was taken from, which changes nothing. A flush of that
+/// block from *before* the snapshot cannot be told from those two by height
+/// alone; that would take the server numbering its flushes. A snapshot frame
+/// is a reset and is never held back.
+fn behind_snapshot(seq: Seq, snapshot_height: u64) -> bool {
+    matches!(seq, Seq::Sticky(h) | Seq::Block(h) if h < snapshot_height)
+}
+
 /// Free a subscription from `source_id` and park everyone on it for a rebuild,
 /// returning the parked client ids. The incremental half of a resync, shared by
 /// the per-source watchdogs and the per-key one.
@@ -916,11 +938,20 @@ impl AppState {
         }
 
         // Clone the (cheap) Arc handles so we can release the shard lock before
-        // touching per-client channels. Pending chain fixes go with the first
-        // frame delivered after them: an update is chained, a snapshot needs
-        // nothing (see `chained_to`).
+        // touching per-client channels. A pending chain fix goes with the first
+        // frame delivered at or above its snapshot: an update is chained, a
+        // snapshot needs nothing (see `chained_to`). A frame below it is not
+        // sent to that client at all (see `behind_snapshot`).
         let subscribers = if deliver { Some(entry.subscribers.clone()) } else { None };
-        let fixes = if deliver && !entry.chain_fix.is_empty() { std::mem::take(&mut entry.chain_fix) } else { Vec::new() };
+        let mut fixes = Vec::new();
+        let mut behind: Vec<u64> = Vec::new();
+        if deliver && !entry.chain_fix.is_empty() {
+            let (wait, due): (Vec<_>, Vec<_>) =
+                std::mem::take(&mut entry.chain_fix).into_iter().partition(|&(_, h)| behind_snapshot(seq, h));
+            behind = wait.iter().map(|&(id, _)| id).collect();
+            entry.chain_fix = wait;
+            fixes = due;
+        }
         drop(entry);
 
         if win {
@@ -940,6 +971,9 @@ impl AppState {
 
         if let Some(subscribers) = subscribers {
             for client in subscribers {
+                if behind.contains(&client.id) {
+                    continue;
+                }
                 let frame = match fixes.iter().find(|(id, _)| *id == client.id) {
                     Some(&(_, height)) => chained_to(&payload, height).unwrap_or_else(|| payload.clone()),
                     None => payload.clone(),
@@ -1730,6 +1764,45 @@ mod tests {
         assert_eq!(chained(130), None, "already chained");
         assert_eq!(chained(140), None, "a real gap is left for the client to see");
         assert!(chained_to(&msg("snap@130"), 130).is_none(), "a snapshot has no chain to fix");
+    }
+
+    #[test]
+    fn a_frame_older_than_a_late_joiners_snapshot_is_not_sent_to_it() {
+        let (state, key, late, mut late_rx, mut first_rx) = late_l2diff_joiner();
+        let a = state.sources[0].clone();
+        // Our connection lags the one the snapshot came from: a frame below
+        // the snapshot arrives after it. Its changes are in the snapshot, with
+        // newer sizes than the frame's own.
+        state.deliver_snapshot(&key, late.id, a.id, 130, msg("snap@130"));
+        state.on_update(&a, key.clone(), Seq::Sticky(120), msg(&upd(120, 100)));
+        assert_eq!(drain(&mut late_rx), vec!["snap@130".to_string()]);
+        assert_eq!(drain(&mut first_rx), vec![upd(120, 100)], "everyone else gets it");
+
+        // The chain fix waits for the first frame past the snapshot.
+        state.on_update(&a, key.clone(), Seq::Sticky(150), msg(&upd(150, 120)));
+        assert_eq!(drain(&mut late_rx), vec![upd(150, 130)]);
+        assert_eq!(drain(&mut first_rx), vec![upd(150, 120)]);
+    }
+
+    #[test]
+    fn a_frame_at_a_late_joiners_snapshot_height_is_sent_and_chained() {
+        let (state, key, late, mut late_rx, _first_rx) = late_l2diff_joiner();
+        let a = state.sources[0].clone();
+        state.deliver_snapshot(&key, late.id, a.id, 130, msg("snap@130"));
+        // One block is flushed more than once: this may be the flush after the
+        // snapshot, and the client needs it.
+        state.on_update(&a, key.clone(), Seq::Sticky(130), msg(&upd(130, 100)));
+        assert_eq!(drain(&mut late_rx), vec!["snap@130".to_string(), upd(130, 130)]);
+        state.on_update(&a, key.clone(), Seq::Sticky(140), msg(&upd(140, 130)));
+        assert_eq!(drain(&mut late_rx), vec![upd(140, 130)]);
+    }
+
+    #[test]
+    fn only_a_frame_below_the_snapshot_is_behind_it() {
+        assert!(behind_snapshot(Seq::Sticky(129), 130));
+        assert!(!behind_snapshot(Seq::Sticky(130), 130), "may be the next flush of the same block");
+        assert!(!behind_snapshot(Seq::Sticky(131), 130));
+        assert!(!behind_snapshot(Seq::Snapshot(120), 130), "a snapshot is a reset");
     }
 
     #[test]

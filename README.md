@@ -172,7 +172,11 @@ nothing changed at that depth — but a client checking the chain, as the
 server's documentation tells it to, would resubscribe, and on a quiet coin
 keep doing so. That first update's `prevHeight` is therefore rewritten to the
 snapshot's height, for that client only. One above the snapshot's height is a
-real gap and is passed on as it is.
+real gap and is passed on as it is. The opposite can happen too: ours can be
+*behind* the connection the snapshot came from, so frames below the snapshot's
+height may still arrive after it. Their changes are in the snapshot already,
+and applying them would put older sizes over newer ones, so that client does
+not get them; the rewrite waits for the first frame at or above the snapshot.
 
 "Dies" is not only the whole source going quiet or falling behind. A leader can
 stop sending **one** `l2Diff` subscription while carrying on with everything
